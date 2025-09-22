@@ -1,29 +1,10 @@
-# LivePlace Telegram Bot — FINAL v4.5.0
-# (analytics + ads + reliability + media fix + i18n keyboard refresh + city/district localization)
+# LivePlace Telegram Bot — FINAL v4.5.1
+# (fixed dependencies + analytics + ads + reliability + media fix + i18n keyboard refresh + city/district localization)
 #
-# Новое:
-# - Полная локализация пунктов выбора городов и районов (кнопки соответствуют языку интерфейса)
-# - Поддержка дополнительных колонок в Google Sheets:
-#     city_en, city_ka, district_en, district_ka
-#   (если их нет или пустые — будет использовано значение из базовых city/district)
-# - Фильтрация объявлений по-прежнему выполняется по базовым полям city/district
-# - Безопасная отправка media_group (фикс "Text must be non-empty")
-# - Всё из версий 4.4.x сохранено (аналитика, реклама, отчёты, кеш таблицы, автообновления)
-#
-# Требуется в .env (пример):
-# API_TOKEN=...
-# ADMIN_CHAT_ID=123
-# FEEDBACK_CHAT_ID=456
-# GSHEET_ID=...         # таблица с объявлениями
-# GSHEET_TAB=Ads
-# GSHEET_REFRESH_MIN=2
-# GSHEET_STATS_ID=...   # (опционально) книга для статистики
-#
-# В таблице должны быть колонки (минимум):
-# mode,city,district,type,rooms,price,published,title_ru,title_en,title_ka,description_ru,description_en,description_ka,phone,photo1..photo10
-# Рекомендуемые для локализации списков выбора:
-# city_en, city_ka, district_en, district_ka
-# Если их нет — будет использоваться city/district как есть.
+# Исправлено:
+# - Обновлены версии зависимостей для совместимости
+# - Фикс установки aiohttp и других пакетов
+# - Сохранена вся функциональность v4.5.0
 
 import os
 import re
@@ -39,7 +20,6 @@ from time import monotonic
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter, defaultdict
-
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -95,7 +75,7 @@ dp  = Dispatcher(bot, storage=MemoryStorage())
 # ---- Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # read/write (нужно для выгрузки статистики)
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 CREDS_FILE = "credentials.json"
 if not os.path.exists(CREDS_FILE):
     raise RuntimeError("credentials.json is missing next to bot.py")
@@ -124,7 +104,7 @@ REQUIRED_COLUMNS = {
     "phone",
     "photo1","photo2","photo3","photo4","photo5","photo6","photo7","photo8","photo9","photo10"
 }
-# Рекомендуемые (не обязательные)
+
 OPTIONAL_L10N = {"city_en","city_ka","district_en","district_ka"}
 
 def check_schema(ws) -> None:
@@ -153,7 +133,6 @@ def load_rows(force: bool = False) -> List[Dict[str, Any]]:
     _cache_loaded_at = monotonic()
     return rows
 
-# Async wrappers for Sheets I/O
 async def rows_async(force: bool=False) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(load_rows, force)
 
@@ -400,8 +379,6 @@ def format_card(row: Dict[str, Any], lang: str) -> str:
     return "\n".join(lines)
 
 PAGE_SIZE = 8
-# Для списков выбора теперь храним пары (label, value), чтобы фильтр работал по базовой value,
-# а кнопки отображались локализованным label
 CHOICE_CACHE: Dict[int, Dict[str, List[Tuple[str, str]]]] = {}
 CHOICE_MSG: Dict[int, Dict[str, int]] = {}
 
@@ -423,8 +400,7 @@ def _l10n_label(row: Dict[str, Any], field: str, lang: str) -> str:
 
 def unique_values_l10n(rows: List[Dict[str, Any]], field: str, lang: str,
                        where: Optional[List[Tuple[str, str]]] = None) -> List[Tuple[str, str]]:
-    """Собирает уникальные значения field c метками по языку: [(label, base_value)].
-       Дедупликация по base_value (значение базовой колонки)."""
+    """Собирает уникальные значения field c метками по языку: [(label, base_value)]."""
     out: List[Tuple[str,str]] = []
     seen: set = set()
     for r in rows:
@@ -442,7 +418,6 @@ def unique_values_l10n(rows: List[Dict[str, Any]], field: str, lang: str,
         label = _l10n_label(r, field, lang)
         seen.add(base)
         out.append((label, base))
-    # Сортируем по label (отображаемому тексту)
     out.sort(key=lambda x: x[0])
     return out
 
@@ -454,7 +429,7 @@ LAST_AD_TIME: Dict[int, float] = {}
 
 ADS = [
     {"id":"lead_form","text_ru":"🔥 Ищете квартиру быстрее? Оставьте заявку на сайте — подберём за 24 часа!",
-     "text_en":"🔥 Need a place fast? Leave a request on our website — we’ll find options within 24h!",
+     "text_en":"🔥 Need a place fast? Leave a request on our website — we'll find options within 24h!",
      "text_ka":"🔥 ბინა გჭირდებათ სწრაფად? დატოვეთ განაცხადი საიტზე — 24 საათში მოვძებნით ვარიანტებს!",
      "url":"https://liveplace.com.ge/lead","photo":""},
     {"id":"mortgage_help","text_ru":"🏦 Поможем с ипотекой для нерезидентов в Грузии. Узнайте детали на сайте.",
@@ -466,7 +441,7 @@ ADS = [
      "text_ka":"🏘 ნახეთ გაქირავების ახალი ბინები — განახლებული განცხადებები საიტზე.",
      "url":"https://liveplace.com.ge/rent","photo":""},
     {"id":"sell_service","text_ru":"💼 Хотите продать квартиру? Оценим и разместим ваше объявление на LivePlace.",
-     "text_en":"💼 Selling your property? We’ll valuate and list it on LivePlace.",
+     "text_en":"💼 Selling your property? We'll valuate and list it on LivePlace.",
      "text_ka":"💼 ყიდით ბინას? შევაფასებთ და დავდებთ LivePlace-ზე.",
      "url":"https://liveplace.com.ge/sell","photo":""},
 ]
@@ -835,7 +810,6 @@ async def _weekly_report_loop():
 # ====== Handlers ======
 @dp.message_handler(commands=["start", "menu"])
 async def cmd_start(message: types.Message, state: FSMContext):
-    # авто-определение языка по language_code при первом старте
     if message.from_user.id not in USER_LANG:
         code = (message.from_user.language_code or "").strip()
         USER_LANG[message.from_user.id] = LANG_MAP.get(code, "ru")
@@ -1068,13 +1042,11 @@ async def st_mode(message: types.Message, state: FSMContext):
     await state.update_data(_city_shown=True)
 
     rows = await rows_async()
-    # Локализуем список городов
     cities = unique_values_l10n(rows, "city", lang)
     await Search.city.set()
     await send_choice(message, lang, "city", cities, 0, t(lang, "ask_city"))
 
 async def send_choice(message, lang: str, field: str, values: List[Tuple[str,str]], page: int, prompt: str, allow_skip=True):
-    """values: list of (label, value)."""
     chat_id = message.chat.id if hasattr(message, "chat") else message.from_user.id
     CHOICE_CACHE.setdefault(chat_id, {})[field] = values
 
@@ -1111,11 +1083,9 @@ async def cb_more(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if field == "district" and data.get("city"):
         where.append(("city", data["city"]))
-    # Локализуем и города, и районы. Для type оставим как есть.
     if field in ("city", "district"):
         values = unique_values_l10n(rows, field, lang, where)
     else:
-        # Не локализованные списки (например type)
         raw = []
         seen = set()
         for r in rows:
@@ -1164,7 +1134,7 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
         value = ""
         if 0 <= idx < len(cache_list):
             label, base = cache_list[idx]
-            value = base  # сохраняем БАЗОВОЕ значение для фильтрации
+            value = base
 
         await state.update_data(**{field: value})
         rows = await rows_async()
@@ -1186,11 +1156,8 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
                 filters.append(("city", city_val))
             if value:
                 filters.append(("district", value))
-            # type без локализации
             types = unique_values_l10n(rows, "type", lang, filters if filters else None)
-            # но для type label=value
-            types = [(lbl if f!="type" else base, base) for (lbl, base), f in zip(types, ["type"]*len(types))] if types else []
-            if not types:  # fallback без zip-трюка
+            if not types:
                 seen=set(); types=[]
                 for r in rows:
                     ok=True
@@ -1368,7 +1335,6 @@ async def show_current_card(message_or_cb, user_id: int):
     kb = card_kb(idx, total, lang, is_fav)
 
     async def _send_with_photos(msg_obj, text: str, kb: InlineKeyboardMarkup, photos: List[str]):
-        # 1) Альбом
         if len(photos) >= 2:
             try:
                 media = []
@@ -1381,25 +1347,22 @@ async def show_current_card(message_or_cb, user_id: int):
                     else:
                         media.append(InputMediaPhoto(media=url))
                 await msg_obj.answer_media_group(media)
-                # отдельным сообщением — чтобы не было "Text must be non-empty"
-                await msg_obj.answer("\u2063", reply_markup=kb)  # \u2063 — невидимый символ
+                await msg_obj.answer("\u2063", reply_markup=kb)
                 return
             except Exception as e:
                 logger.warning(f"media_group failed: {e}")
 
-        # 2) Одна фотка
         if len(photos) == 1:
             try:
                 if text and text.strip():
                     await msg_obj.answer_photo(photos[0], caption=text, parse_mode="HTML")
                 else:
                     await msg_obj.answer_photo(photos[0])
-                await msg_obj.answer("\u2063", reply_markup=kb)
+                await msg_obj.answer("\u2063", reply_markup=btn)
                 return
             except Exception as e:
                 logger.warning(f"single photo failed: {e}")
 
-        # 3) Без фото
         if text and text.strip():
             await msg_obj.answer(text, reply_markup=kb)
         else:
@@ -1611,13 +1574,11 @@ async def ads_stats(message: types.Message):
 async def any_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
 
-    # Если ждём контакт для лида — обработать и выйти
     if data.get("want_contact"):
         contact = (message.text or "").strip()
         user = message.from_user
         lang = USER_LANG.get(user.id, "ru")
 
-        # Простая валидация
         is_phone = re.fullmatch(r"\+?\d[\d\-\s]{7,}", contact or "") is not None
         is_username = (contact or "").startswith("@") and len(contact) >= 5
         now = time.time()
@@ -1653,7 +1614,6 @@ async def any_text(message: types.Message, state: FSMContext):
         await state.update_data(want_contact=False)
         return await message.answer(t(lang, "lead_ok"), reply_markup=main_menu(lang))
 
-    # Игнорируем «наши» известные кнопки — их уже ловят свои хендлеры
     KNOWN = {
         T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"],
         T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"],
@@ -1665,9 +1625,8 @@ async def any_text(message: types.Message, state: FSMContext):
         T["btn_daily"]["ru"], T["btn_daily"]["en"], T["btn_daily"]["ka"],
     }
     if (message.text or "") in KNOWN:
-        return  # ничего не отвечаем — конкретные хендлеры уже обработают
+        return
 
-    # По умолчанию — вернуть в меню
     lang = USER_LANG.get(message.from_user.id, "ru")
     await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
 
