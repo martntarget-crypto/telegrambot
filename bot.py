@@ -29,7 +29,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
 )
-
+os.sistem(pip install -r requirements.txt)
 # ---- .env
 try:
     from dotenv import load_dotenv
@@ -1634,3 +1634,4 @@ async def any_text(message: types.Message, state: FSMContext):
 if __name__ == "__main__":
     logger.info("LivePlace bot is running…")
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
