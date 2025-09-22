@@ -1,5 +1,5 @@
-aiogram==2.25.2
-python-dotenv
-gspread
-google-auth
-pandas
+aiogram==2.25.1
+gspread==5.8.0
+google-auth==2.16.0
+python-dotenv==1.0.0
+aiohttp==3.8.5
