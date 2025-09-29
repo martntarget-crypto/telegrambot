@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Virtual environments
+venv/
+.venv/
+
+# dotenv
+.env
+.env.local
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Docker
+*.log
