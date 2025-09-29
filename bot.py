@@ -67,7 +67,14 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMINS_SET
 
 # ---- Bot
-bot = Bot(token=API_TOKEN, parse_mode="HTML")
+from aiogram.client.bot import DefaultBotProperties
+from aiogram import Bot
+
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
+
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
