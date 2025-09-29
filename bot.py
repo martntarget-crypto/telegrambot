@@ -1,10 +1,5 @@
-# LivePlace Telegram Bot — FINAL v4.5.1
-# (fixed dependencies + analytics + ads + reliability + media fix + i18n keyboard refresh + city/district localization)
-#
-# Исправлено:
-# - Обновлены версии зависимостей для совместимости
-# - Фикс установки aiohttp и других пакетов
-# - Сохранена вся функциональность v4.5.0
+# LivePlace Telegram Bot — FINAL v4.5.0 (aiogram 3.12.0)
+# Адаптирован под: aiogram==3.12.0, gspread==5.8.0, google-auth==2.16.0
 
 import os
 import re
@@ -21,15 +16,18 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter, defaultdict
 
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
+    InlineKeyboardMarkup, InlineKeyboardButton, 
+    CallbackQuery, InputMediaPhoto, Message
 )
-os.sistem(pip install -r requirements.txt)
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
 # ---- .env
 try:
     from dotenv import load_dotenv
@@ -70,7 +68,8 @@ def is_admin(user_id: int) -> bool:
 
 # ---- Bot
 bot = Bot(token=API_TOKEN, parse_mode="HTML")
-dp  = Dispatcher(bot, storage=MemoryStorage())
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 # ---- Google Sheets
 import gspread
@@ -104,7 +103,7 @@ REQUIRED_COLUMNS = {
     "phone",
     "photo1","photo2","photo3","photo4","photo5","photo6","photo7","photo8","photo9","photo10"
 }
-
+# Рекомендуемые (не обязательные)
 OPTIONAL_L10N = {"city_en","city_ka","district_en","district_ka"}
 
 def check_schema(ws) -> None:
@@ -133,6 +132,7 @@ def load_rows(force: bool = False) -> List[Dict[str, Any]]:
     _cache_loaded_at = monotonic()
     return rows
 
+# Async wrappers for Sheets I/O
 async def rows_async(force: bool=False) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(load_rows, force)
 
@@ -267,12 +267,18 @@ def build_utm_url(raw: str, ad_id: str, uid: int) -> str:
 
 # ---- Menus
 def main_menu(lang: str) -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton(T["btn_fast"][lang]))
-    kb.row(KeyboardButton(T["btn_search"][lang]), KeyboardButton(T["btn_latest"][lang]))
-    kb.add(KeyboardButton(T["btn_favs"][lang]))
-    kb.add(KeyboardButton(T["btn_language"][lang]), KeyboardButton(T["btn_about"][lang]))
-    return kb
+    builder = ReplyKeyboardBuilder()
+    builder.add(KeyboardButton(text=T["btn_fast"][lang]))
+    builder.row(
+        KeyboardButton(text=T["btn_search"][lang]),
+        KeyboardButton(text=T["btn_latest"][lang])
+    )
+    builder.add(KeyboardButton(text=T["btn_favs"][lang]))
+    builder.row(
+        KeyboardButton(text=T["btn_language"][lang]),
+        KeyboardButton(text=T["btn_about"][lang])
+    )
+    return builder.as_markup(resize_keyboard=True)
 
 # ---- Auto-refresh cache
 async def _auto_refresh_loop():
@@ -400,7 +406,8 @@ def _l10n_label(row: Dict[str, Any], field: str, lang: str) -> str:
 
 def unique_values_l10n(rows: List[Dict[str, Any]], field: str, lang: str,
                        where: Optional[List[Tuple[str, str]]] = None) -> List[Tuple[str, str]]:
-    """Собирает уникальные значения field c метками по языку: [(label, base_value)]."""
+    """Собирает уникальные значения field c метками по языку: [(label, base_value)].
+       Дедупликация по base_value (значение базовой колонки)."""
     out: List[Tuple[str,str]] = []
     seen: set = set()
     for r in rows:
@@ -418,6 +425,7 @@ def unique_values_l10n(rows: List[Dict[str, Any]], field: str, lang: str,
         label = _l10n_label(r, field, lang)
         seen.add(base)
         out.append((label, base))
+    # Сортируем по label (отображаемому тексту)
     out.sort(key=lambda x: x[0])
     return out
 
@@ -473,7 +481,10 @@ async def maybe_show_ad(message_or_cb, uid: int, context: Dict[str, Any]):
 
         txt = ad.get(f"text_{lang}") or ad.get("text_ru") or "LivePlace"
         url = build_utm_url(ad.get("url"), ad.get("id", "ad"), uid)
-        btn = InlineKeyboardMarkup().add(InlineKeyboardButton(cta_text(lang), url=url))
+        
+        builder = InlineKeyboardBuilder()
+        builder.add(InlineKeyboardButton(text=cta_text(lang), url=url))
+        btn = builder.as_markup()
 
         target = message_or_cb.message if isinstance(message_or_cb, types.CallbackQuery) else message_or_cb
 
@@ -754,7 +765,7 @@ def push_day_all(day: str):
 
 # ===================  /АНАЛИТИКА  ======================
 
-async def on_startup(dp):
+async def on_startup():
     try:
         await rows_async(force=True)
     except Exception as e:
@@ -808,35 +819,36 @@ async def _weekly_report_loop():
         await asyncio.sleep(30)
 
 # ====== Handlers ======
-@dp.message_handler(commands=["start", "menu"])
-async def cmd_start(message: types.Message, state: FSMContext):
+@dp.message(Command("start", "menu"))
+async def cmd_start(message: Message, state: FSMContext):
+    # авто-определение языка по language_code при первом старте
     if message.from_user.id not in USER_LANG:
         code = (message.from_user.language_code or "").strip()
         USER_LANG[message.from_user.id] = LANG_MAP.get(code, "ru")
     lang = USER_LANG[message.from_user.id]
-    await state.finish()
+    await state.clear()
     await message.answer(t(lang, "start"), reply_markup=main_menu(lang))
 
-@dp.message_handler(commands=["home"])
-async def cmd_home(message: types.Message, state: FSMContext):
+@dp.message(Command("home"))
+async def cmd_home(message: Message, state: FSMContext):
     lang = USER_LANG.get(message.from_user.id, "ru")
-    await state.finish()
+    await state.clear()
     await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
 
-@dp.message_handler(commands=["lang_ru", "lang_en", "lang_ka"])
-async def cmd_lang(message: types.Message):
-    code = message.get_command().replace("/lang_", "")
+@dp.message(Command("lang_ru", "lang_en", "lang_ka"))
+async def cmd_lang(message: Message):
+    code = message.text.replace("/lang_", "").strip()
     if code not in LANGS:
         code = "ru"
     USER_LANG[message.from_user.id] = code
     await message.answer(t(code, "menu_title"), reply_markup=main_menu(code))
 
-@dp.message_handler(commands=["whoami"], state="*")
-async def cmd_whoami(message: types.Message, state: FSMContext):
+@dp.message(Command("whoami"))
+async def cmd_whoami(message: Message, state: FSMContext):
     await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
 
-@dp.message_handler(commands=["admin_debug"], state="*")
-async def cmd_admin_debug(message: types.Message, state: FSMContext):
+@dp.message(Command("admin_debug"))
+async def cmd_admin_debug(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа.")
     await message.answer(
@@ -850,8 +862,8 @@ async def cmd_admin_debug(message: types.Message, state: FSMContext):
         f"Cache rows: {len(_cached_rows)}, TTLmin={GSHEET_REFRESH_MIN}"
     )
 
-@dp.message_handler(commands=["health"])
-async def cmd_health(message: types.Message):
+@dp.message(Command("health"))
+async def cmd_health(message: Message):
     try:
         sh = await asyncio.to_thread(open_spreadsheet)
         tabs = [w.title for w in sh.worksheets()]
@@ -871,16 +883,16 @@ async def cmd_health(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ {e}")
 
-@dp.message_handler(commands=["gs"])
-async def cmd_gs(message: types.Message):
+@dp.message(Command("gs"))
+async def cmd_gs(message: Message):
     try:
         rows = await rows_async(force=True)
         await message.answer(f"GS rows: {len(rows)}")
     except Exception as e:
         await message.answer(f"GS error: {e}")
 
-@dp.message_handler(commands=["reload", "refresh"])
-async def cmd_reload(message: types.Message):
+@dp.message(Command("reload", "refresh"))
+async def cmd_reload(message: Message):
     try:
         rows = await rows_async(force=True)
         await message.answer(f"♻️ Reloaded. Rows: {len(rows)}")
@@ -888,22 +900,22 @@ async def cmd_reload(message: types.Message):
         await message.answer(f"Reload error: {e}")
 
 # ----- ANALYTICS COMMANDS -----
-@dp.message_handler(commands=["stats", "stats_today"], state="*")
-async def cmd_stats(message: types.Message, state: FSMContext):
+@dp.message(Command("stats", "stats_today"))
+async def cmd_stats(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа к статистике.")
     parts = (message.text or "").split(maxsplit=1)
     day = parts[1].strip() if len(parts) == 2 else None
     await message.answer(render_stats(day) or "Данных пока нет.")
 
-@dp.message_handler(commands=["stats_week"], state="*")
-async def cmd_stats_week(message: types.Message, state: FSMContext):
+@dp.message(Command("stats_week"))
+async def cmd_stats_week(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа.")
     await message.answer(render_week_summary())
 
-@dp.message_handler(commands=["top_today"], state="*")
-async def cmd_top_today(message: types.Message, state: FSMContext):
+@dp.message(Command("top_today"))
+async def cmd_top_today(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа.")
     day = _today_str()
@@ -915,8 +927,8 @@ async def cmd_top_today(message: types.Message, state: FSMContext):
     ]
     await message.answer("\n".join(txt))
 
-@dp.message_handler(commands=["top_week"], state="*")
-async def cmd_top_week(message: types.Message, state: FSMContext):
+@dp.message(Command("top_week"))
+async def cmd_top_week(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа.")
     end_dt = datetime.utcnow()
@@ -934,8 +946,8 @@ async def cmd_top_week(message: types.Message, state: FSMContext):
     ]
     await message.answer("\n".join(txt))
 
-@dp.message_handler(commands=["stats_push"], state="*")
-async def cmd_stats_push(message: types.Message, state: FSMContext):
+@dp.message(Command("stats_push"))
+async def cmd_stats_push(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа.")
     if not GSHEET_STATS_ID:
@@ -948,33 +960,33 @@ async def cmd_stats_push(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Не удалось записать: {e}")
 
-@dp.message_handler(commands=["export_csv"], state="*")
-async def cmd_export(message: types.Message, state: FSMContext):
+@dp.message(Command("export_csv"))
+async def cmd_export(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа.")
     path = export_analytics_csv("analytics_export.csv")
-    await message.answer_document(types.InputFile(path), caption="Экспорт аналитики (CSV)")
+    await message.answer_document(types.BufferedInputFile(open(path, "rb").read(), filename="analytics_export.csv"), caption="Экспорт аналитики (CSV)")
 
 # ====== ЯЗЫК ======
-@dp.message_handler(lambda m: m.text in (T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"]), state="*")
-async def on_language(message: types.Message, state: FSMContext):
+@dp.message(lambda m: m.text in (T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"]))
+async def on_language(message: Message, state: FSMContext):
     current = USER_LANG.get(message.from_user.id, "ru")
-    kb = InlineKeyboardMarkup(row_width=3)
-    kb.add(
-        InlineKeyboardButton(("🇷🇺 Русский" + (" ✅" if current == "ru" else "")), callback_data="lang:ru"),
-        InlineKeyboardButton(("🇬🇧 English" + (" ✅" if current == "en" else "")), callback_data="lang:en"),
-        InlineKeyboardButton(("🇬🇪 ქართული" + (" ✅" if current == "ka" else "")), callback_data="lang:ka"),
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(text=("🇷🇺 Русский" + (" ✅" if current == "ru" else "")), callback_data="lang:ru"),
+        InlineKeyboardButton(text=("🇬🇧 English" + (" ✅" if current == "en" else "")), callback_data="lang:en"),
+        InlineKeyboardButton(text=("🇬🇪 ქართული" + (" ✅" if current == "ka" else "")), callback_data="lang:ka"),
     )
-    kb.row(InlineKeyboardButton(T["btn_home"][current], callback_data="home"))
-    await message.answer(t(current, "choose_lang"), reply_markup=kb)
+    builder.row(InlineKeyboardButton(text=T["btn_home"][current], callback_data="home"))
+    await message.answer(t(current, "choose_lang"), reply_markup=builder.as_markup())
 
-@dp.callback_query_handler(lambda c: c.data.startswith("lang:"), state="*")
+@dp.callback_query(lambda c: c.data.startswith("lang:"))
 async def cb_set_lang(c: CallbackQuery, state: FSMContext):
     code = c.data.split(":", 1)[1]
     if code not in LANGS:
         return await c.answer("Unknown language", show_alert=False)
     USER_LANG[c.from_user.id] = code
-    await state.finish()
+    await state.clear()
     try:
         await c.message.edit_reply_markup()
     except Exception:
@@ -982,13 +994,13 @@ async def cb_set_lang(c: CallbackQuery, state: FSMContext):
     await c.message.answer(t(code, "menu_title"), reply_markup=main_menu(code))
     await c.answer("OK")
 
-@dp.message_handler(lambda m: m.text in (T["btn_about"]["ru"], T["btn_about"]["en"], T["btn_about"]["ka"]))
-async def on_about(message: types.Message):
+@dp.message(lambda m: m.text in (T["btn_about"]["ru"], T["btn_about"]["en"], T["btn_about"]["ka"]))
+async def on_about(message: Message):
     lang = USER_LANG.get(message.from_user.id, "ru")
     await message.answer(t(lang, "about"))
 
-@dp.message_handler(lambda m: m.text in (T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"]))
-async def on_fast(message: types.Message):
+@dp.message(lambda m: m.text in (T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"]))
+async def on_fast(message: Message):
     lang = USER_LANG.get(message.from_user.id, "ru")
     try:
         rows = await rows_async()
@@ -1007,24 +1019,34 @@ async def on_fast(message: types.Message):
     await show_current_card(message, message.from_user.id)
 
 # ====== Поиск ======
-@dp.message_handler(lambda m: m.text in (T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"]))
-async def on_search(message: types.Message, state: FSMContext):
+@dp.message(lambda m: m.text in (T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"]))
+async def on_search(message: Message, state: FSMContext):
     lang = USER_LANG.get(message.from_user.id, "ru")
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton(T["btn_rent"][lang]), KeyboardButton(T["btn_sale"][lang]), KeyboardButton(T["btn_daily"][lang]))
-    kb.add(KeyboardButton(T["btn_latest"][lang]), KeyboardButton(T["btn_fast"][lang]))
-    kb.add(KeyboardButton(T["btn_language"][lang]), KeyboardButton(T["btn_home"][lang]))
-    await Search.mode.set()
-    await message.answer(t(lang, "wiz_intro"), reply_markup=kb)
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        KeyboardButton(text=T["btn_rent"][lang]),
+        KeyboardButton(text=T["btn_sale"][lang]), 
+        KeyboardButton(text=T["btn_daily"][lang])
+    )
+    builder.row(
+        KeyboardButton(text=T["btn_latest"][lang]),
+        KeyboardButton(text=T["btn_fast"][lang])
+    )
+    builder.row(
+        KeyboardButton(text=T["btn_language"][lang]),
+        KeyboardButton(text=T["btn_home"][lang])
+    )
+    await state.set_state(Search.mode)
+    await message.answer(t(lang, "wiz_intro"), reply_markup=builder.as_markup(resize_keyboard=True))
 
-@dp.message_handler(lambda m: m.text in (T["btn_home"]["ru"], T["btn_home"]["en"], T["btn_home"]["ka"]), state="*")
-async def on_home_text(message: types.Message, state: FSMContext):
+@dp.message(lambda m: m.text in (T["btn_home"]["ru"], T["btn_home"]["en"], T["btn_home"]["ka"]))
+async def on_home_text(message: Message, state: FSMContext):
     lang = USER_LANG.get(message.from_user.id, "ru")
-    await state.finish()
+    await state.clear()
     await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
 
-@dp.message_handler(state=Search.mode)
-async def st_mode(message: types.Message, state: FSMContext):
+@dp.message(StateFilter(Search.mode))
+async def st_mode(message: Message, state: FSMContext):
     lang = USER_LANG.get(message.from_user.id, "ru")
     text = message.text or ""
     picked = ""
@@ -1042,38 +1064,43 @@ async def st_mode(message: types.Message, state: FSMContext):
     await state.update_data(_city_shown=True)
 
     rows = await rows_async()
+    # Локализуем список городов
     cities = unique_values_l10n(rows, "city", lang)
-    await Search.city.set()
+    await state.set_state(Search.city)
     await send_choice(message, lang, "city", cities, 0, t(lang, "ask_city"))
 
 async def send_choice(message, lang: str, field: str, values: List[Tuple[str,str]], page: int, prompt: str, allow_skip=True):
+    """values: list of (label, value)."""
     chat_id = message.chat.id if hasattr(message, "chat") else message.from_user.id
     CHOICE_CACHE.setdefault(chat_id, {})[field] = values
 
-    kb = InlineKeyboardMarkup()
+    builder = InlineKeyboardBuilder()
     start = page * PAGE_SIZE
     chunk = values[start:start+PAGE_SIZE]
     for idx, (label, _base) in enumerate(chunk, start=start):
-        kb.add(InlineKeyboardButton(label, callback_data=f"pick:{field}:{idx}"))
+        builder.add(InlineKeyboardButton(text=label, callback_data=f"pick:{field}:{idx}"))
+    builder.adjust(1)
+    
     controls = []
     if start + PAGE_SIZE < len(values):
-        controls.append(InlineKeyboardButton(T["btn_more"][lang], callback_data=f"more:{field}:{page+1}"))
+        controls.append(InlineKeyboardButton(text=T["btn_more"][lang], callback_data=f"more:{field}:{page+1}"))
     if allow_skip:
-        controls.append(InlineKeyboardButton(T["btn_skip"][lang], callback_data=f"pick:{field}:-1"))
+        controls.append(InlineKeyboardButton(text=T["btn_skip"][lang], callback_data=f"pick:{field}:-1"))
     if controls:
-        kb.row(*controls)
-    kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-    sent = await message.answer(prompt, reply_markup=kb)
+        builder.row(*controls)
+    builder.row(InlineKeyboardButton(text=T["btn_home"][lang], callback_data="home"))
+    
+    sent = await message.answer(prompt, reply_markup=builder.as_markup())
     CHOICE_MSG.setdefault(chat_id, {})[field] = sent.message_id
 
-@dp.callback_query_handler(lambda c: c.data == "home", state="*")
+@dp.callback_query(lambda c: c.data == "home")
 async def cb_home(c: CallbackQuery, state: FSMContext):
     lang = USER_LANG.get(c.from_user.id, "ru")
-    await state.finish()
+    await state.clear()
     await c.message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
     await c.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("more:"))
+@dp.callback_query(lambda c: c.data.startswith("more:"))
 async def cb_more(c: CallbackQuery, state: FSMContext):
     _, field, page = c.data.split(":", 2)
     page = int(page)
@@ -1083,9 +1110,11 @@ async def cb_more(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if field == "district" and data.get("city"):
         where.append(("city", data["city"]))
+    # Локализуем и города, и районы. Для type оставим как есть.
     if field in ("city", "district"):
         values = unique_values_l10n(rows, field, lang, where)
     else:
+        # Не локализованные списки (например type)
         raw = []
         seen = set()
         for r in rows:
@@ -1103,25 +1132,28 @@ async def cb_more(c: CallbackQuery, state: FSMContext):
         raw.sort(key=lambda x: x[0])
         values = raw
 
-    kb = InlineKeyboardMarkup()
+    builder = InlineKeyboardBuilder()
     start = page * PAGE_SIZE
     chunk = values[start:start+PAGE_SIZE]
     for idx, (label, _base) in enumerate(chunk, start=start):
-        kb.add(InlineKeyboardButton(label, callback_data=f"pick:{field}:{idx}"))
+        builder.add(InlineKeyboardButton(text=label, callback_data=f"pick:{field}:{idx}"))
+    builder.adjust(1)
+    
     controls = []
     if start + PAGE_SIZE < len(values):
-        controls.append(InlineKeyboardButton(T["btn_more"][lang], callback_data=f"more:{field}:{page+1}"))
-    controls.append(InlineKeyboardButton(T["btn_skip"][lang], callback_data=f"pick:{field}:-1"))
+        controls.append(InlineKeyboardButton(text=T["btn_more"][lang], callback_data=f"more:{field}:{page+1}"))
+    controls.append(InlineKeyboardButton(text=T["btn_skip"][lang], callback_data=f"pick:{field}:-1"))
     if controls:
-        kb.row(*controls)
-    kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
+        builder.row(*controls)
+    builder.row(InlineKeyboardButton(text=T["btn_home"][lang], callback_data="home"))
+    
     try:
-        await c.message.edit_reply_markup(reply_markup=kb)
+        await c.message.edit_reply_markup(reply_markup=builder.as_markup())
     except Exception:
-        await c.message.answer(t(lang, f"ask_{'city' if field=='city' else field}"), reply_markup=kb)
+        await c.message.answer(t(lang, f"ask_{'city' if field=='city' else field}"), reply_markup=builder.as_markup())
     await c.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("pick:"), state="*")
+@dp.callback_query(lambda c: c.data.startswith("pick:"))
 async def cb_pick(c: CallbackQuery, state: FSMContext):
     try:
         _, field, idxs = c.data.split(":", 2)
@@ -1134,7 +1166,7 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
         value = ""
         if 0 <= idx < len(cache_list):
             label, base = cache_list[idx]
-            value = base
+            value = base  # сохраняем БАЗОВОЕ значение для фильтрации
 
         await state.update_data(**{field: value})
         rows = await rows_async()
@@ -1147,7 +1179,7 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
         if field == "city":
             d_where = [("city", value)] if value else None
             dists = unique_values_l10n(rows, "district", lang, d_where)
-            await Search.district.set()
+            await state.set_state(Search.district)
             await send_choice(c.message, lang, "district", dists, 0, t(lang, "ask_district"))
         elif field == "district":
             city_val = (await state.get_data()).get("city", "")
@@ -1156,8 +1188,11 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
                 filters.append(("city", city_val))
             if value:
                 filters.append(("district", value))
+            # type без локализации
             types = unique_values_l10n(rows, "type", lang, filters if filters else None)
-            if not types:
+            # но для type label=value
+            types = [(lbl if f!="type" else base, base) for (lbl, base), f in zip(types, ["type"]*len(types))] if types else []
+            if not types:  # fallback без zip-трюка
                 seen=set(); types=[]
                 for r in rows:
                     ok=True
@@ -1168,16 +1203,17 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
                     if v and v not in seen:
                         seen.add(v); types.append((v,v))
                 types.sort(key=lambda x:x[0])
-            await Search.rtype.set()
+            await state.set_state(Search.rtype)
             await send_choice(c.message, lang, "type", types, 0, t(lang, "ask_type"))
         elif field == "type":
-            kb = InlineKeyboardMarkup()
+            builder = InlineKeyboardBuilder()
             for r in ["1", "2", "3", "4", "5+"]:
-                kb.add(InlineKeyboardButton(r, callback_data=f"rooms:{r}"))
-            kb.row(InlineKeyboardButton(T["btn_skip"][lang], callback_data="rooms:"))
-            kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-            await Search.rooms.set()
-            await c.message.answer(t(lang, "ask_rooms"), reply_markup=kb)
+                builder.add(InlineKeyboardButton(text=r, callback_data=f"rooms:{r}"))
+            builder.adjust(3)
+            builder.row(InlineKeyboardButton(text=T["btn_skip"][lang], callback_data="rooms:"))
+            builder.row(InlineKeyboardButton(text=T["btn_home"][lang], callback_data="home"))
+            await state.set_state(Search.rooms)
+            await c.message.answer(t(lang, "ask_rooms"), reply_markup=builder.as_markup())
         elif field == "price":
             await finish_search(c.message, c.from_user.id, await state.get_data())
         await c.answer()
@@ -1188,7 +1224,7 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
         except Exception:
             pass
 
-@dp.callback_query_handler(lambda c: c.data.startswith("rooms:"), state=Search.rooms)
+@dp.callback_query(lambda c: c.data.startswith("rooms:"))
 async def cb_rooms(c: CallbackQuery, state: FSMContext):
     val = c.data.split(":", 1)[1]
     if val == "5+":
@@ -1222,26 +1258,27 @@ async def cb_rooms(c: CallbackQuery, state: FSMContext):
         ]
     rngs = price_ranges(data.get("mode", "rent"))
 
-    kb = InlineKeyboardMarkup()
+    builder = InlineKeyboardBuilder()
     for label, code in rngs:
-        kb.add(InlineKeyboardButton(label, callback_data=f"price:{code}"))
-    kb.row(InlineKeyboardButton(T["btn_skip"][lang], callback_data="price:"))
-    kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-    await Search.price.set()
-    await c.message.answer(t(lang, "ask_price"), reply_markup=kb)
+        builder.add(InlineKeyboardButton(text=label, callback_data=f"price:{code}"))
+    builder.adjust(2)
+    builder.row(InlineKeyboardButton(text=T["btn_skip"][lang], callback_data="price:"))
+    builder.row(InlineKeyboardButton(text=T["btn_home"][lang], callback_data="home"))
+    await state.set_state(Search.price)
+    await c.message.answer(t(lang, "ask_price"), reply_markup=builder.as_markup())
     await c.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("price:"), state=Search.price)
+@dp.callback_query(lambda c: c.data.startswith("price:"))
 async def cb_price(c: CallbackQuery, state: FSMContext):
     rng = c.data.split(":",1)[1]
     if rng:
         a,b = rng.split("-")
         await state.update_data(price_min=int(a), price_max=int(b))
     await finish_search(c.message, c.from_user.id, await state.get_data())
-    await state.finish()
+    await state.clear()
     await c.answer()
 
-async def finish_search(message: types.Message, user_id: int, data: Dict[str,Any]):
+async def finish_search(message: Message, user_id: int, data: Dict[str,Any]):
     lang = USER_LANG.get(user_id, "ru")
     try:
         rows = await rows_async()
@@ -1291,22 +1328,22 @@ async def finish_search(message: types.Message, user_id: int, data: Dict[str,Any
     await show_current_card(message, user_id)
 
 def card_kb(idx: int, total: int, lang: str, fav: bool) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
+    builder = InlineKeyboardBuilder()
     row1 = []
     if idx > 0:
-        row1.append(InlineKeyboardButton(T["btn_prev"][lang], callback_data=f"pg:{idx-1}"))
+        row1.append(InlineKeyboardButton(text=T["btn_prev"][lang], callback_data=f"pg:{idx-1}"))
     if idx < total-1:
-        row1.append(InlineKeyboardButton(T["btn_next"][lang], callback_data=f"pg:{idx+1}"))
+        row1.append(InlineKeyboardButton(text=T["btn_next"][lang], callback_data=f"pg:{idx+1}"))
     if row1:
-        kb.row(*row1)
-    kb.row(
-        InlineKeyboardButton(T["btn_like"][lang], callback_data="like"),
-        InlineKeyboardButton(T["btn_dislike"][lang], callback_data="dislike"),
+        builder.row(*row1)
+    builder.row(
+        InlineKeyboardButton(text=T["btn_like"][lang], callback_data="like"),
+        InlineKeyboardButton(text=T["btn_dislike"][lang], callback_data="dislike"),
     )
-    kb.row(InlineKeyboardButton(T["btn_fav_del"][lang] if fav else T["btn_fav_add"][lang], callback_data="fav"))
-    kb.row(InlineKeyboardButton(T["btn_share"][lang], switch_inline_query=""))
-    kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-    return kb
+    builder.row(InlineKeyboardButton(text=T["btn_fav_del"][lang] if fav else T["btn_fav_add"][lang], callback_data="fav"))
+    builder.row(InlineKeyboardButton(text=T["btn_share"][lang], switch_inline_query=""))
+    builder.row(InlineKeyboardButton(text=T["btn_home"][lang], callback_data="home"))
+    return builder.as_markup()
 
 async def show_current_card(message_or_cb, user_id: int):
     lang = USER_LANG.get(user_id, "ru")
@@ -1335,6 +1372,7 @@ async def show_current_card(message_or_cb, user_id: int):
     kb = card_kb(idx, total, lang, is_fav)
 
     async def _send_with_photos(msg_obj, text: str, kb: InlineKeyboardMarkup, photos: List[str]):
+        # 1) Альбом
         if len(photos) >= 2:
             try:
                 media = []
@@ -1347,22 +1385,25 @@ async def show_current_card(message_or_cb, user_id: int):
                     else:
                         media.append(InputMediaPhoto(media=url))
                 await msg_obj.answer_media_group(media)
-                await msg_obj.answer("\u2063", reply_markup=kb)
+                # отдельным сообщением — чтобы не было "Text must be non-empty"
+                await msg_obj.answer("\u2063", reply_markup=kb)  # \u2063 — невидимый символ
                 return
             except Exception as e:
                 logger.warning(f"media_group failed: {e}")
 
+        # 2) Одна фотка
         if len(photos) == 1:
             try:
                 if text and text.strip():
                     await msg_obj.answer_photo(photos[0], caption=text, parse_mode="HTML")
                 else:
                     await msg_obj.answer_photo(photos[0])
-                await msg_obj.answer("\u2063", reply_markup=btn)
+                await msg_obj.answer("\u2063", reply_markup=kb)
                 return
             except Exception as e:
                 logger.warning(f"single photo failed: {e}")
 
+        # 3) Без фото
         if text and text.strip():
             await msg_obj.answer(text, reply_markup=kb)
         else:
@@ -1395,7 +1436,7 @@ async def show_current_card(message_or_cb, user_id: int):
             else:
                 await message_or_cb.answer("\u2063", reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: c.data.startswith("pg:"))
+@dp.callback_query(lambda c: c.data.startswith("pg:"))
 async def cb_page(c: CallbackQuery):
     idx = int(c.data.split(":")[1])
     if c.from_user.id in USER_RESULTS:
@@ -1403,7 +1444,7 @@ async def cb_page(c: CallbackQuery):
     await show_current_card(c, c.from_user.id)
     await c.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "fav")
+@dp.callback_query(lambda c: c.data == "fav")
 async def cb_fav(c: CallbackQuery):
     user_id = c.from_user.id
     data = USER_RESULTS.get(user_id, {})
@@ -1426,7 +1467,7 @@ async def cb_fav(c: CallbackQuery):
         await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_saved"))
     await show_current_card(c, user_id)
 
-@dp.callback_query_handler(lambda c: c.data == "like")
+@dp.callback_query(lambda c: c.data == "like")
 async def cb_like(c: CallbackQuery, state: FSMContext):
     user_id = c.from_user.id
     lang = USER_LANG.get(user_id, "ru")
@@ -1455,7 +1496,7 @@ async def cb_like(c: CallbackQuery, state: FSMContext):
     await c.message.answer(t(lang, "lead_ask"))
     await c.answer("OK")
 
-@dp.callback_query_handler(lambda c: c.data == "dislike")
+@dp.callback_query(lambda c: c.data == "dislike")
 async def cb_dislike(c: CallbackQuery):
     user_id = c.from_user.id
     dataset = USER_RESULTS.get(user_id, {})
@@ -1476,9 +1517,9 @@ async def cb_dislike(c: CallbackQuery):
     await show_current_card(c, user_id)
     await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_next"))
 
-@dp.message_handler(lambda m: m.text in (T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"]), state="*")
-async def on_favs(message: types.Message, state: FSMContext):
-    await state.finish()
+@dp.message(lambda m: m.text in (T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"]))
+async def on_favs(message: Message, state: FSMContext):
+    await state.clear()
     lang = USER_LANG.get(message.from_user.id, "ru")
     favs = set(USER_FAVS.get(message.from_user.id, []))
     if not favs:
@@ -1492,29 +1533,29 @@ async def on_favs(message: types.Message, state: FSMContext):
     await show_current_card(message, message.from_user.id)
 
 # =====================  АДМИН: РЕКЛАМА =====================
-@dp.message_handler(commands=["ads_on"])
-async def ads_on(message: types.Message):
+@dp.message(Command("ads_on"))
+async def ads_on(message: Message):
     if not is_admin(message.from_user.id):
         return
     global ADS_ENABLED
     ADS_ENABLED = True
     await message.answer("✅ Реклама включена")
 
-@dp.message_handler(commands=["ads_off"])
-async def ads_off(message: types.Message):
+@dp.message(Command("ads_off"))
+async def ads_off(message: Message):
     if not is_admin(message.from_user.id):
         return
     global ADS_ENABLED
     ADS_ENABLED = False
     await message.answer("⛔ Реклама выключена")
 
-@dp.message_handler(commands=["ads_prob"])
-async def ads_prob(message: types.Message):
+@dp.message(Command("ads_prob"))
+async def ads_prob(message: Message):
     if not is_admin(message.from_user.id):
         return
     global ADS_PROB
     try:
-        val = float(message.get_args())
+        val = float(message.text.split()[1])
         if 0 <= val <= 1:
             ADS_PROB = val
             await message.answer(f"🔄 Вероятность показа рекламы обновлена: {val*100:.0f}%")
@@ -1523,20 +1564,20 @@ async def ads_prob(message: types.Message):
     except Exception:
         await message.answer("❌ Использование: /ads_prob 0.25")
 
-@dp.message_handler(commands=["ads_cooldown"])
-async def ads_cooldown(message: types.Message):
+@dp.message(Command("ads_cooldown"))
+async def ads_cooldown(message: Message):
     if not is_admin(message.from_user.id):
         return
     global ADS_COOLDOWN_SEC
     try:
-        val = int(message.get_args())
+        val = int(message.text.split()[1])
         ADS_COOLDOWN_SEC = val
         await message.answer(f"⏱ Кулдаун показа рекламы обновлён: {val} сек.")
     except Exception:
         await message.answer("❌ Использование: /ads_cooldown 300")
 
-@dp.message_handler(commands=["ads_test"])
-async def ads_test(message: types.Message):
+@dp.message(Command("ads_test"))
+async def ads_test(message: Message):
     if not is_admin(message.from_user.id):
         return
     ad = random.choice(ADS) if ADS else None
@@ -1545,7 +1586,9 @@ async def ads_test(message: types.Message):
     lang = current_lang_for(message.from_user.id)
     txt = ad.get(f"text_{lang}") or ad.get("text_ru") or "LivePlace"
     url = build_utm_url(ad.get("url"), ad.get("id", "ad"), message.from_user.id)
-    btn = InlineKeyboardMarkup().add(InlineKeyboardButton(cta_text(lang), url=url))
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text=cta_text(lang), url=url))
+    btn = builder.as_markup()
     if ad.get("photo"):
         try:
             await message.answer_photo(ad["photo"], caption=txt, reply_markup=btn)
@@ -1555,8 +1598,8 @@ async def ads_test(message: types.Message):
         await message.answer(txt, reply_markup=btn)
     await message.answer("🧪 Тестовая реклама отправлена.")
 
-@dp.message_handler(commands=["ads_stats"])
-async def ads_stats(message: types.Message):
+@dp.message(Command("ads_stats"))
+async def ads_stats(message: Message):
     if not is_admin(message.from_user.id):
         return
     txt = ["📊 Статистика рекламы:"]
@@ -1570,15 +1613,17 @@ async def ads_stats(message: types.Message):
     await message.answer("\n".join(txt))
 
 # ----- Общий обработчик НЕ-команд -----
-@dp.message_handler(lambda m: not ((m.text or "").startswith("/")) and not m.from_user.is_bot, state="*")
-async def any_text(message: types.Message, state: FSMContext):
+@dp.message(lambda m: not m.text.startswith("/") and not m.from_user.is_bot)
+async def any_text(message: Message, state: FSMContext):
     data = await state.get_data()
 
+    # Если ждём контакт для лида — обработать и выйти
     if data.get("want_contact"):
         contact = (message.text or "").strip()
         user = message.from_user
         lang = USER_LANG.get(user.id, "ru")
 
+        # Простая валидация
         is_phone = re.fullmatch(r"\+?\d[\d\-\s]{7,}", contact or "") is not None
         is_username = (contact or "").startswith("@") and len(contact) >= 5
         now = time.time()
@@ -1614,6 +1659,7 @@ async def any_text(message: types.Message, state: FSMContext):
         await state.update_data(want_contact=False)
         return await message.answer(t(lang, "lead_ok"), reply_markup=main_menu(lang))
 
+    # Игнорируем «наши» известные кнопки — их уже ловят свои хендлеры
     KNOWN = {
         T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"],
         T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"],
@@ -1625,13 +1671,17 @@ async def any_text(message: types.Message, state: FSMContext):
         T["btn_daily"]["ru"], T["btn_daily"]["en"], T["btn_daily"]["ka"],
     }
     if (message.text or "") in KNOWN:
-        return
+        return  # ничего не отвечаем — конкретные хендлеры уже обработают
 
+    # По умолчанию — вернуть в меню
     lang = USER_LANG.get(message.from_user.id, "ru")
     await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
 
 # ---- Run
-if __name__ == "__main__":
+async def main():
     logger.info("LivePlace bot is running…")
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    await on_startup()
+    await dp.start_polling(bot)
 
+if __name__ == "__main__":
+    asyncio.run(main())
