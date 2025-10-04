@@ -14,6 +14,8 @@ from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from time import monotonic
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
+import aiohttp
+from io import BytesIO
 from collections import Counter, defaultdict
 
 from aiogram import Bot, Dispatcher, types
@@ -323,25 +325,43 @@ def drive_direct(url: str) -> str:
         return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
     return url
 
+
 def looks_like_image(url: str) -> bool:
     u = (url or "").strip().lower()
     if not u:
         return False
-    if any(u.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+    # common web image extensions (incl. gifs, bmp)
+    if any(u.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
         return True
+    # google drive / googleusercontent direct links
     if "google.com/uc?export=download" in u or "googleusercontent.com" in u:
         return True
     return False
 
+
 def collect_photos(row: Dict[str, Any]) -> List[str]:
-    photos = []
+    photos: List[str] = []
+    # Expect columns like photo1..photo10
     for i in range(1, 11):
-        url = str(row.get(f"photo{i}", "")).strip()
-        if not url:
+        key = f"photo{i}"
+        val = (row.get(key, "") or "").strip()
+        if not val:
             continue
-        url = drive_direct(url)
-        if looks_like_image(url):
-            photos.append(url)
+        # some cells may contain multiple tokens or whitespace; take the first token that looks like a url
+        candidates = re.split(r"[,\s]+", val)
+        for token in candidates:
+            token = token.strip()
+            if not token:
+                continue
+            # sometimes there's trailing text; take until first whitespace or comma
+            token = token.split()[0].strip().strip(",;")
+            if not token:
+                continue
+            # convert Google Drive link to direct if possible
+            token = drive_direct(token)
+            if looks_like_image(token):
+                photos.append(token)
+                break
     return photos
 
 def parse_rooms(v: Any) -> float:
@@ -1025,6 +1045,26 @@ async def on_fast(message: Message):
     await message.answer(t(lang, "results_found", n=len(rows_sorted[:30])))
     await show_current_card(message, message.from_user.id)
 
+
+
+@dp.message(lambda m: m.text in (T["btn_latest"]["ru"], T["btn_latest"]["en"], T["btn_latest"]["ka"]))
+async def on_latest(message: Message):
+    lang = USER_LANG.get(message.from_user.id, "ru")
+    try:
+        rows = await rows_async()
+    except Exception as e:
+        return await message.answer(f"Sheets error: {e}")
+    def key_pub(r):
+        try:
+            return datetime.fromisoformat(str(r.get("published", "")))
+        except Exception:
+            return datetime.min
+    rows_sorted = sorted(rows, key=key_pub, reverse=True)
+    USER_RESULTS[message.from_user.id] = {"rows": rows_sorted[:30], "idx": 0, "context": {}}
+    if not rows_sorted:
+        return await message.answer(t(lang, "no_results"))
+    await message.answer(t(lang, "results_found", n=len(rows_sorted[:30])))
+    await show_current_card(message, message.from_user.id)
 # ====== Поиск ======
 @dp.message(lambda m: m.text in (T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"]))
 async def on_search(message: Message, state: FSMContext):
@@ -1378,317 +1418,99 @@ async def show_current_card(message_or_cb, user_id: int):
     photos = collect_photos(row)[:10]
     kb = card_kb(idx, total, lang, is_fav)
 
-    async def _send_with_photos(msg_obj, text: str, kb: InlineKeyboardMarkup, photos: List[str]):
-        # 1) Альбом
-        if len(photos) >= 2:
+    async 
+async def _send_with_photos(msg_obj, text: str, kb: InlineKeyboardMarkup, photos: List[str]):
+    async def try_media_group_with_urls(photos):
+        try:
+            media = []
+            for i, url in enumerate(photos):
+                if i == 0 and text and text.strip():
+                    media.append(InputMediaPhoto(media=url, caption=text, parse_mode="HTML"))
+                else:
+                    media.append(InputMediaPhoto(media=url))
+            await msg_obj.answer_media_group(media)
+            await msg_obj.answer("\u2063", reply_markup=kb)
+            return True
+        except Exception:
+            logger.exception("media_group with remote URLs failed")
+            return False
+
+    async def try_single_photo_url(url):
+        try:
+            if text and text.strip():
+                await msg_obj.answer_photo(url, caption=text, parse_mode="HTML")
+            else:
+                await msg_obj.answer_photo(url)
+            await msg_obj.answer("\u2063", reply_markup=kb)
+            return True
+        except Exception:
+            logger.exception("single photo with remote URL failed")
+            return False
+
+    async def download_image(url, timeout=20):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        logger.warning("download_image: status %s for %s", resp.status, url)
+                        return None, None
+                    ct = resp.headers.get("Content-Type", "")
+                    if not ct.startswith("image/"):
+                        logger.warning("download_image: not image content-type %s for %s", ct, url)
+                        return None, None
+                    data = await resp.read()
+                    if not data:
+                        return None, None
+                    ext = ct.split("/")[-1].split(";")[0] or "jpg"
+                    bio = BytesIO(data)
+                    bio.seek(0)
+                    fname = f"photo.{ext}"
+                    return bio, fname
+        except Exception:
+            logger.exception("download_image failed for %s", url)
+            return None, None
+
+    # 1) Try direct sending
+    if len(photos) >= 2:
+        if await try_media_group_with_urls(photos):
+            return
+        # fallback: download all images and upload
+        downloaded = []
+        for url in photos:
+            bio, fname = await download_image(url)
+            if bio:
+                downloaded.append((bio, fname))
+        if downloaded:
             try:
                 media = []
-                for i, url in enumerate(photos):
-                    if i == 0:
-                        if text and text.strip():
-                            media.append(InputMediaPhoto(media=url, caption=text, parse_mode="HTML"))
-                        else:
-                            media.append(InputMediaPhoto(media=url))
+                for i, (bio, fname) in enumerate(downloaded):
+                    input_file = InputFile(bio, filename=fname)
+                    if i == 0 and text and text.strip():
+                        media.append(InputMediaPhoto(media=input_file, caption=text, parse_mode="HTML"))
                     else:
-                        media.append(InputMediaPhoto(media=url))
+                        media.append(InputMediaPhoto(media=input_file))
                 await msg_obj.answer_media_group(media)
-                # отдельным сообщением — чтобы не было "Text must be non-empty"
-                await msg_obj.answer("\u2063", reply_markup=kb)  # \u2063 — невидимый символ
-                return
-            except Exception as e:
-                logger.warning(f"media_group failed: {e}")
-
-        # 2) Одна фотка
-        if len(photos) == 1:
-            try:
-                if text and text.strip():
-                    await msg_obj.answer_photo(photos[0], caption=text, parse_mode="HTML")
-                else:
-                    await msg_obj.answer_photo(photos[0])
                 await msg_obj.answer("\u2063", reply_markup=kb)
                 return
-            except Exception as e:
-                logger.warning(f"single photo failed: {e}")
-
-        # 3) Без фото
-        if text and text.strip():
-            await msg_obj.answer(text, reply_markup=kb)
-        else:
-            await msg_obj.answer("\u2063", reply_markup=kb)
-
-    if isinstance(message_or_cb, CallbackQuery):
-        m = message_or_cb.message
-        try:
-            if photos:
-                await _send_with_photos(m, text, kb, photos)
-            else:
-                if text and text.strip():
-                    await m.edit_text(text, reply_markup=kb)
-                else:
-                    await m.answer("\u2063", reply_markup=kb)
-        except Exception:
-            if photos:
-                await _send_with_photos(m, text, kb, photos)
-            else:
-                if text and text.strip():
-                    await m.answer(text, reply_markup=kb)
-                else:
-                    await m.answer("\u2063", reply_markup=kb)
-    else:
-        if photos:
-            await _send_with_photos(message_or_cb, text, kb, photos)
-        else:
-            if text and text.strip():
-                await message_or_cb.answer(text, reply_markup=kb)
-            else:
-                await message_or_cb.answer("\u2063", reply_markup=kb)
-
-@dp.callback_query(lambda c: c.data.startswith("pg:"))
-async def cb_page(c: CallbackQuery):
-    idx = int(c.data.split(":")[1])
-    if c.from_user.id in USER_RESULTS:
-        USER_RESULTS[c.from_user.id]["idx"] = idx
-    await show_current_card(c, c.from_user.id)
-    await c.answer()
-
-@dp.callback_query(lambda c: c.data == "fav")
-async def cb_fav(c: CallbackQuery):
-    user_id = c.from_user.id
-    data = USER_RESULTS.get(user_id, {})
-    rows = data.get("rows", [])
-    idx  = data.get("idx", 0)
-    if not rows:
-        return await c.answer("No data")
-    row = rows[idx]
-    key = make_row_key(row)
-    favs = USER_FAVS.setdefault(user_id, [])
-    if key in favs:
-        favs.remove(key)
-        try: log_event("fav_remove", user_id, row=row)
-        except Exception: pass
-        await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_removed"))
-    else:
-        favs.append(key)
-        try: log_event("fav_add", user_id, row=row)
-        except Exception: pass
-        await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_saved"))
-    await show_current_card(c, user_id)
-
-@dp.callback_query(lambda c: c.data == "like")
-async def cb_like(c: CallbackQuery, state: FSMContext):
-    user_id = c.from_user.id
-    lang = USER_LANG.get(user_id, "ru")
-    data = USER_RESULTS.get(user_id, {})
-    rows = data.get("rows", [])
-    idx  = data.get("idx", 0)
-    if not rows:
-        return await c.answer("No data")
-
-    row = rows[idx]
-    pre_msg = (
-        f"❤️ LIKE from {c.from_user.full_name} (@{c.from_user.username or 'no_username'})\n\n" +
-        format_card(row, lang)
-    )
-    try:
-        target = FEEDBACK_CHAT_ID or ADMIN_CHAT_ID
-        if target:
-            await bot.send_message(chat_id=target, text=pre_msg)
-    except Exception as e:
-        logger.warning(f"Failed to send pre-lead: {e}")
-
-    try: log_event("like", user_id, row=row)
-    except Exception: pass
-
-    await state.update_data(want_contact=True)
-    await c.message.answer(t(lang, "lead_ask"))
-    await c.answer("OK")
-
-@dp.callback_query(lambda c: c.data == "dislike")
-async def cb_dislike(c: CallbackQuery):
-    user_id = c.from_user.id
-    dataset = USER_RESULTS.get(user_id, {})
-    rows = dataset.get("rows", [])
-    if not rows:
-        return await c.answer("No data")
-    cur_idx = dataset.get("idx", 0)
-    try:
-        if 0 <= cur_idx < len(rows):
-            log_event("dislike", user_id, row=rows[cur_idx])
-    except Exception: pass
-
-    idx = cur_idx + 1
-    if idx >= len(rows):
-        await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_no_more"))
-        return
-    USER_RESULTS[user_id]["idx"] = idx
-    await show_current_card(c, user_id)
-    await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_next"))
-
-@dp.message(lambda m: m.text in (T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"]))
-async def on_favs(message: Message, state: FSMContext):
-    await state.clear()
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    favs = set(USER_FAVS.get(message.from_user.id, []))
-    if not favs:
-        return await message.answer("Пока нет избранного.", reply_markup=main_menu(lang))
-    rows = await rows_async()
-    picked = [r for r in rows if make_row_key(r) in favs]
-    if not picked:
-        return await message.answer("Пока нет избранного.", reply_markup=main_menu(lang))
-    USER_RESULTS[message.from_user.id] = {"rows": picked, "idx": 0, "context": {}}
-    await message.answer(f"Избранное: {len(picked)}")
-    await show_current_card(message, message.from_user.id)
-
-# =====================  АДМИН: РЕКЛАМА =====================
-@dp.message(Command("ads_on"))
-async def ads_on(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    global ADS_ENABLED
-    ADS_ENABLED = True
-    await message.answer("✅ Реклама включена")
-
-@dp.message(Command("ads_off"))
-async def ads_off(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    global ADS_ENABLED
-    ADS_ENABLED = False
-    await message.answer("⛔ Реклама выключена")
-
-@dp.message(Command("ads_prob"))
-async def ads_prob(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    global ADS_PROB
-    try:
-        val = float(message.text.split()[1])
-        if 0 <= val <= 1:
-            ADS_PROB = val
-            await message.answer(f"🔄 Вероятность показа рекламы обновлена: {val*100:.0f}%")
-        else:
-            await message.answer("⚠ Укажи число от 0 до 1 (например, 0.25)")
-    except Exception:
-        await message.answer("❌ Использование: /ads_prob 0.25")
-
-@dp.message(Command("ads_cooldown"))
-async def ads_cooldown(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    global ADS_COOLDOWN_SEC
-    try:
-        val = int(message.text.split()[1])
-        ADS_COOLDOWN_SEC = val
-        await message.answer(f"⏱ Кулдаун показа рекламы обновлён: {val} сек.")
-    except Exception:
-        await message.answer("❌ Использование: /ads_cooldown 300")
-
-@dp.message(Command("ads_test"))
-async def ads_test(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    ad = random.choice(ADS) if ADS else None
-    if not ad:
-        return await message.answer("Нет креативов ADS.")
-    lang = current_lang_for(message.from_user.id)
-    txt = ad.get(f"text_{lang}") or ad.get("text_ru") or "LivePlace"
-    url = build_utm_url(ad.get("url"), ad.get("id", "ad"), message.from_user.id)
-    builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text=cta_text(lang), url=url))
-    btn = builder.as_markup()
-    if ad.get("photo"):
-        try:
-            await message.answer_photo(ad["photo"], caption=txt, reply_markup=btn)
-        except Exception:
-            await message.answer(txt, reply_markup=btn)
-    else:
-        await message.answer(txt, reply_markup=btn)
-    await message.answer("🧪 Тестовая реклама отправлена.")
-
-@dp.message(Command("ads_stats"))
-async def ads_stats(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    txt = ["📊 Статистика рекламы:"]
-    total = 0
-    for day, data in sorted(AGG_BY_DAY.items()):
-        cnt = data.get("ad_show", 0)
-        if cnt:
-            txt.append(f"{day}: {cnt}")
-            total += cnt
-    txt.append(f"ИТОГО: {total}")
-    await message.answer("\n".join(txt))
-
-# ----- Общий обработчик НЕ-команд -----
-@dp.message(lambda m: not m.text.startswith("/") and not m.from_user.is_bot)
-async def any_text(message: Message, state: FSMContext):
-    data = await state.get_data()
-
-    # Если ждём контакт для лида — обработать и выйти
-    if data.get("want_contact"):
-        contact = (message.text or "").strip()
-        user = message.from_user
-        lang = USER_LANG.get(user.id, "ru")
-
-        # Простая валидация
-        is_phone = re.fullmatch(r"\+?\d[\d\-\s]{7,}", contact or "") is not None
-        is_username = (contact or "").startswith("@") and len(contact) >= 5
-        now = time.time()
-        last = LAST_LEAD_AT.get(user.id, 0.0)
-        if not (is_phone or is_username):
-            return await message.answer(t(lang, "lead_invalid"))
-        if now - last < LEAD_COOLDOWN:
-            return await message.answer(t(lang, "lead_too_soon"))
-
-        try:
-            dataset = USER_RESULTS.get(user.id, {})
-            rows = dataset.get("rows", [])
-            idx  = dataset.get("idx", 0)
-            row = rows[idx] if rows else None
-
-            lead_msg = (
-                f"📩 Lead from {user.full_name} (@{user.username or 'no_username'})\n"
-                f"Contact: {contact}\n\n" +
-                (format_card(row, lang) if row else "(no current listing)")
-            )
-            target = FEEDBACK_CHAT_ID or ADMIN_CHAT_ID
-            if target:
-                await bot.send_message(chat_id=target, text=lead_msg)
-            try:
-                if row:
-                    log_event("lead", user.id, row=row, extra={"contact": contact})
             except Exception:
-                pass
-            LAST_LEAD_AT[user.id] = now
-        except Exception as e:
-            logger.warning(f"Lead send failed: {e}")
+                logger.exception("media_group with uploaded files failed")
 
-        await state.update_data(want_contact=False)
-        return await message.answer(t(lang, "lead_ok"), reply_markup=main_menu(lang))
+    # single photo case
+    if len(photos) == 1:
+        url = photos[0]
+        if await try_single_photo_url(url):
+            return
+        bio, fname = await download_image(url)
+        if bio:
+            try:
+                await msg_obj.answer_photo(InputFile(bio, filename=fname), caption=text if text else None, parse_mode="HTML")
+                await msg_obj.answer("\u2063", reply_markup=kb)
+                return
+            except Exception:
+                logger.exception("single photo upload failed")
 
-    # Игнорируем «наши» известные кнопки — их уже ловят свои хендлеры
-    KNOWN = {
-        T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"],
-        T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"],
-        T["btn_latest"]["ru"], T["btn_latest"]["en"], T["btn_latest"]["ka"],
-        T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"],
-        T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"],
-        T["btn_about"]["ru"], T["btn_about"]["en"], T["btn_about"]["ka"],
-        T["btn_home"]["ru"], T["btn_home"]["en"], T["btn_home"]["ka"],
-        T["btn_daily"]["ru"], T["btn_daily"]["en"], T["btn_daily"]["ka"],
-    }
-    if (message.text or "") in KNOWN:
-        return  # ничего не отвечаем — конкретные хендлеры уже обработают
-
-    # По умолчанию — вернуть в меню
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
-
-# ---- Run
-async def main():
-    logger.info("LivePlace bot is running…")
-    await on_startup()
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # fallback to text
+    if text and text.strip():
+        await msg_obj.answer(text, reply_markup=kb)
+    else:
+        await msg_obj.answer("\u2063", reply_markup=kb)
