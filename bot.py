@@ -1,4 +1,4 @@
-# LivePlace Telegram Bot — FINAL v4.5.0 (aiogram 3.12.0)
+# LivePlace Telegram Bot — FINAL v4.5.1 (aiogram 3.12.0)
 # Адаптирован под: aiogram==3.12.0, gspread==5.8.0, google-auth==2.16.0
 
 import os
@@ -26,7 +26,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, 
-    CallbackQuery, InputMediaPhoto, Message
+    CallbackQuery, InputMediaPhoto, Message, InputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
@@ -317,14 +317,14 @@ def norm_mode(v: str) -> str:
 def drive_direct(url: str) -> str:
     if not url:
         return url
-    m = re.search(r"/d/([A-Za-z0-9_-]{20,})/", url)
+    # Исправленный regex для Google Drive ссылок
+    m = re.search(r"/d/([A-Za-z0-9_-]{25,})/", url)
     if m:
         return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-    m = re.search(r"[?&]id=([A-Za-z0-9_-]{20,})", url)
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]{25,})", url)
     if m:
         return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
     return url
-
 
 def looks_like_image(url: str) -> bool:
     u = (url or "").strip().lower()
@@ -337,7 +337,6 @@ def looks_like_image(url: str) -> bool:
     if "google.com/uc?export=download" in u or "googleusercontent.com" in u:
         return True
     return False
-
 
 def collect_photos(row: Dict[str, Any]) -> List[str]:
     photos: List[str] = []
@@ -926,6 +925,24 @@ async def cmd_reload(message: Message):
     except Exception as e:
         await message.answer(f"Reload error: {e}")
 
+@dp.message(Command("check_data"))
+async def cmd_check_data(message: Message):
+    try:
+        rows = await rows_async()
+        if not rows:
+            return await message.answer("Нет данных в таблице")
+        
+        # Проверяем первую запись
+        first_row = rows[0]
+        await message.answer(f"Первая запись:\n{json.dumps(first_row, indent=2, ensure_ascii=False)}")
+        
+        # Проверяем фото
+        photos = collect_photos(first_row)
+        await message.answer(f"Найдено фото: {len(photos)}\n{photos}")
+        
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
 # ----- ANALYTICS COMMANDS -----
 @dp.message(Command("stats", "stats_today"))
 async def cmd_stats(message: Message, state: FSMContext):
@@ -1045,8 +1062,6 @@ async def on_fast(message: Message):
     await message.answer(t(lang, "results_found", n=len(rows_sorted[:30])))
     await show_current_card(message, message.from_user.id)
 
-
-
 @dp.message(lambda m: m.text in (T["btn_latest"]["ru"], T["btn_latest"]["en"], T["btn_latest"]["ka"]))
 async def on_latest(message: Message):
     lang = USER_LANG.get(message.from_user.id, "ru")
@@ -1054,17 +1069,38 @@ async def on_latest(message: Message):
         rows = await rows_async()
     except Exception as e:
         return await message.answer(f"Sheets error: {e}")
-    def key_pub(r):
+    
+    # Фильтруем по дате: последние 7 дней
+    now = datetime.now()
+    filtered_rows = []
+    for row in rows:
+        pub_str = row.get("published", "").strip()
+        if not pub_str:
+            continue
         try:
-            return datetime.fromisoformat(str(r.get("published", "")))
-        except Exception:
-            return datetime.min
-    rows_sorted = sorted(rows, key=key_pub, reverse=True)
-    USER_RESULTS[message.from_user.id] = {"rows": rows_sorted[:30], "idx": 0, "context": {}}
-    if not rows_sorted:
+            # Пробуем разные форматы дат
+            if ' ' in pub_str:
+                pub_date = datetime.strptime(pub_str, "%Y-%m-%d %H:%M:%S")
+            else:
+                pub_date = datetime.strptime(pub_str, "%Y-%m-%d")
+            # Если разница в днях <= 7, то включаем
+            if (now - pub_date).days <= 7:
+                filtered_rows.append(row)
+        except Exception as e:
+            # Если не удалось распарсить, пропускаем
+            continue
+    
+    # Сортируем по дате публикации (новые сначала)
+    filtered_rows.sort(key=lambda x: x.get("published", ""), reverse=True)
+    
+    USER_RESULTS[message.from_user.id] = {"rows": filtered_rows[:50], "idx": 0, "context": {}}
+    
+    if not filtered_rows:
         return await message.answer(t(lang, "no_results"))
-    await message.answer(t(lang, "results_found", n=len(rows_sorted[:30])))
+    
+    await message.answer(t(lang, "results_found", n=len(filtered_rows)))
     await show_current_card(message, message.from_user.id)
+
 # ====== Поиск ======
 @dp.message(lambda m: m.text in (T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"]))
 async def on_search(message: Message, state: FSMContext):
@@ -1418,99 +1454,124 @@ async def show_current_card(message_or_cb, user_id: int):
     photos = collect_photos(row)[:10]
     kb = card_kb(idx, total, lang, is_fav)
 
-    async 
+    await _send_with_photos(message_or_cb, text, kb, photos)
+
 async def _send_with_photos(msg_obj, text: str, kb: InlineKeyboardMarkup, photos: List[str]):
-    async def try_media_group_with_urls(photos):
-        try:
-            media = []
-            for i, url in enumerate(photos):
-                if i == 0 and text and text.strip():
-                    media.append(InputMediaPhoto(media=url, caption=text, parse_mode="HTML"))
-                else:
-                    media.append(InputMediaPhoto(media=url))
-            await msg_obj.answer_media_group(media)
-            await msg_obj.answer("\u2063", reply_markup=kb)
-            return True
-        except Exception:
-            logger.exception("media_group with remote URLs failed")
-            return False
-
-    async def try_single_photo_url(url):
-        try:
-            if text and text.strip():
-                await msg_obj.answer_photo(url, caption=text, parse_mode="HTML")
-            else:
-                await msg_obj.answer_photo(url)
-            await msg_obj.answer("\u2063", reply_markup=kb)
-            return True
-        except Exception:
-            logger.exception("single photo with remote URL failed")
-            return False
-
-    async def download_image(url, timeout=20):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=timeout) as resp:
-                    if resp.status != 200:
-                        logger.warning("download_image: status %s for %s", resp.status, url)
-                        return None, None
-                    ct = resp.headers.get("Content-Type", "")
-                    if not ct.startswith("image/"):
-                        logger.warning("download_image: not image content-type %s for %s", ct, url)
-                        return None, None
-                    data = await resp.read()
-                    if not data:
-                        return None, None
-                    ext = ct.split("/")[-1].split(";")[0] or "jpg"
-                    bio = BytesIO(data)
-                    bio.seek(0)
-                    fname = f"photo.{ext}"
-                    return bio, fname
-        except Exception:
-            logger.exception("download_image failed for %s", url)
-            return None, None
-
-    # 1) Try direct sending
-    if len(photos) >= 2:
-        if await try_media_group_with_urls(photos):
-            return
-        # fallback: download all images and upload
-        downloaded = []
-        for url in photos:
-            bio, fname = await download_image(url)
-            if bio:
-                downloaded.append((bio, fname))
-        if downloaded:
-            try:
-                media = []
-                for i, (bio, fname) in enumerate(downloaded):
-                    input_file = InputFile(bio, filename=fname)
-                    if i == 0 and text and text.strip():
-                        media.append(InputMediaPhoto(media=input_file, caption=text, parse_mode="HTML"))
-                    else:
-                        media.append(InputMediaPhoto(media=input_file))
-                await msg_obj.answer_media_group(media)
-                await msg_obj.answer("\u2063", reply_markup=kb)
-                return
-            except Exception:
-                logger.exception("media_group with uploaded files failed")
-
-    # single photo case
-    if len(photos) == 1:
-        url = photos[0]
-        if await try_single_photo_url(url):
-            return
-        bio, fname = await download_image(url)
-        if bio:
-            try:
-                await msg_obj.answer_photo(InputFile(bio, filename=fname), caption=text if text else None, parse_mode="HTML")
-                await msg_obj.answer("\u2063", reply_markup=kb)
-                return
-            except Exception:
-                logger.exception("single photo upload failed")
-
-    # fallback to text
-    if text and text.strip():
+    if not photos:
+        # Если нет фото, отправляем только текст
         await msg_obj.answer(text, reply_markup=kb)
+        return
+
+    # Пытаемся отправить медиагруппу
+    try:
+        media = []
+        for i, url in enumerate(photos):
+            if i == 0:
+                media.append(InputMediaPhoto(media=url, caption=text, parse_mode="HTML"))
+            else:
+                media.append(InputMediaPhoto(media=url))
+        await msg_obj.answer_media_group(media)
+        # Отправляем клавиатуру отдельным сообщением
+        await msg_obj.answer("⬇️ Действия:", reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Media group failed: {e}")
+        # Fallback: отправляем первое фото с подписью
+        try:
+            await msg_obj.answer_photo(photos[0], caption=text, parse_mode="HTML", reply_markup=kb)
+        except Exception as e2:
+            logger.error(f"Single photo also failed: {e2}")
+            # Final fallback: только текст
+            await msg_obj.answer(text, reply_markup=kb)
+
+@dp.callback_query(lambda c: c.data.startswith("pg:"))
+async def cb_page(c: CallbackQuery):
+    idx = int(c.data.split(":")[1])
+    user_id = c.from_user.id
+    if user_id not in USER_RESULTS:
+        return await c.answer(t("ru", "toast_no_more"), show_alert=False)
+    data = USER_RESULTS[user_id]
+    if idx < 0 or idx >= len(data["rows"]):
+        return await c.answer(t("ru", "toast_no_more"), show_alert=False)
+    data["idx"] = idx
+    await show_current_card(c, user_id)
+    await c.answer()
+
+@dp.callback_query(lambda c: c.data == "like")
+async def cb_like(c: CallbackQuery):
+    user_id = c.from_user.id
+    if user_id not in USER_RESULTS:
+        return await c.answer("Нет активных результатов", show_alert=False)
+    data = USER_RESULTS[user_id]
+    row = data["rows"][data["idx"]]
+    log_event("like", user_id, row=row)
+    await c.answer(t(current_lang_for(user_id), "toast_next"), show_alert=False)
+    # Автоматически переходим к следующему
+    if data["idx"] < len(data["rows"]) - 1:
+        data["idx"] += 1
+        await show_current_card(c, user_id)
+
+@dp.callback_query(lambda c: c.data == "dislike")
+async def cb_dislike(c: CallbackQuery):
+    user_id = c.from_user.id
+    if user_id not in USER_RESULTS:
+        return await c.answer("Нет активных результатов", show_alert=False)
+    data = USER_RESULTS[user_id]
+    row = data["rows"][data["idx"]]
+    log_event("dislike", user_id, row=row)
+    await c.answer(t(current_lang_for(user_id), "toast_next"), show_alert=False)
+    # Автоматически переходим к следующему
+    if data["idx"] < len(data["rows"]) - 1:
+        data["idx"] += 1
+        await show_current_card(c, user_id)
+
+@dp.callback_query(lambda c: c.data == "fav")
+async def cb_fav(c: CallbackQuery):
+    user_id = c.from_user.id
+    if user_id not in USER_RESULTS:
+        return await c.answer("Нет активных результатов", show_alert=False)
+    data = USER_RESULTS[user_id]
+    row = data["rows"][data["idx"]]
+    key = make_row_key(row)
+    
+    if user_id not in USER_FAVS:
+        USER_FAVS[user_id] = []
+    
+    if key in USER_FAVS[user_id]:
+        USER_FAVS[user_id].remove(key)
+        log_event("fav_remove", user_id, row=row)
+        await c.answer(t(current_lang_for(user_id), "toast_removed"), show_alert=False)
     else:
-        await msg_obj.answer("\u2063", reply_markup=kb)
+        USER_FAVS[user_id].append(key)
+        log_event("fav_add", user_id, row=row)
+        await c.answer(t(current_lang_for(user_id), "toast_saved"), show_alert=False)
+    
+    # Обновляем клавиатуру
+    await show_current_card(c, user_id)
+
+@dp.message(lambda m: m.text in (T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"]))
+async def on_favs(message: Message):
+    lang = USER_LANG.get(message.from_user.id, "ru")
+    user_id = message.from_user.id
+    
+    if user_id not in USER_FAVS or not USER_FAVS[user_id]:
+        return await message.answer(t(lang, "no_results"))
+    
+    try:
+        rows = await rows_async()
+    except Exception as e:
+        return await message.answer(f"Sheets error: {e}")
+    
+    fav_keys = USER_FAVS[user_id]
+    fav_rows = [r for r in rows if make_row_key(r) in fav_keys]
+    
+    USER_RESULTS[user_id] = {"rows": fav_rows, "idx": 0, "context": {}}
+    await message.answer(t(lang, "results_found", n=len(fav_rows)))
+    await show_current_card(message, user_id)
+
+# ====== Запуск бота ======
+async def main():
+    await on_startup()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
