@@ -627,12 +627,12 @@ def render_stats(day: str=None) -> str:
 
     lines = []
     lines.append(f"📊 <b>Статистика за {day}</b>")
-    lines.append(f"Реклама показов: {total['ad_show']}")
-    lines.append(f"Всего: просмотров {total['view']}, лайков {total['like']}, дизлайков {total['dislike']}, заявок {total['lead']}, избранное +{total['fav_add']}/-{total['fav_remove']}")
-    lines.append(f"Воронка: search {fun['search']} → view {fun['view']} → like {fun['like']} ({conv_like}) → lead {fun['lead']} ({conv_lead})\n")
+    lines.append(f"Реклама показов: {total.get('ad_show', 0)}")
+    lines.append(f"Всего: просмотров {total.get('view', 0)}, лайков {total.get('like', 0)}, дизлайков {total.get('dislike', 0)}, заявок {total.get('lead', 0)}, избранное +{total.get('fav_add', 0)}/-{total.get('fav_remove', 0)}")
+    lines.append(f"Воронка: search {fun.get('search', 0)} → view {fun.get('view', 0)} → like {fun.get('like', 0)} ({conv_like}) → lead {fun.get('lead', 0)} ({conv_lead})\n")
     lines.append("По режимам:")
     for m in ("rent","daily","sale"):
-        lines.append(f"  • {m}: view {mode[f'{m}_view']}, like {mode[f'{m}_like']}, lead {mode[f'{m}_lead']}")
+        lines.append(f"  • {m}: view {mode.get(f'{m}_view', 0)}, like {mode.get(f'{m}_like', 0)}, lead {mode.get(f'{m}_lead', 0)}")
 
     if city:
         lines.append("\nТоп городов: " + ", ".join([f"{c} {n}" for c,n in city]))
@@ -661,7 +661,7 @@ def render_week_summary(end_day: str=None) -> str:
     for d in days:
         total += AGG_BY_DAY[d]
     lines = [f"📈 <b>Сводка за 7 дней (до {end_day})</b>",
-             f"Просмотры {total['view']}, лайки {total['like']}, дизлайки {total['dislike']}, заявки {total['lead']}, избранное +{total['fav_add']}/-{total['fav_remove']}"]
+             f"Просмотры {total.get('view', 0)}, лайки {total.get('like', 0)}, дизлайки {total.get('dislike', 0)}, заявки {total.get('lead', 0)}, избранное +{total.get('fav_add', 0)}/-{total.get('fav_remove', 0)}"]
     return "\n".join(lines)
 
 def export_analytics_csv(path: str = "analytics_export.csv"):
@@ -757,10 +757,10 @@ def push_daily_to_sheet(day: str):
     total = AGG_BY_DAY[day]
     row = [
         day,
-        total["view"], total["like"], total["dislike"], total["lead"], total["fav_add"], total["fav_remove"],
-        mode["rent_view"], mode["rent_like"], mode["rent_lead"],
-        mode["daily_view"], mode["daily_like"], mode["daily_lead"],
-        mode["sale_view"], mode["sale_like"], mode["sale_lead"],
+        total.get("view", 0), total.get("like", 0), total.get("dislike", 0), total.get("lead", 0), total.get("fav_add", 0), total.get("fav_remove", 0),
+        mode.get("rent_view", 0), mode.get("rent_like", 0), mode.get("rent_lead", 0),
+        mode.get("daily_view", 0), mode.get("daily_like", 0), mode.get("daily_lead", 0),
+        mode.get("sale_view", 0), mode.get("sale_like", 0), mode.get("sale_lead", 0),
     ]
 
     existing = ws.col_values(1)
@@ -979,9 +979,9 @@ async def cmd_top_week(message: Message, state: FSMContext):
     counters = {"views": Counter(), "likes": Counter(), "favorites": Counter()}
     for i in range(7):
         d = (end_dt - timedelta(days=i)).strftime("%Y-%m-%d")
-        counters["views"]      += TOP_LISTINGS[d]
-        counters["likes"]      += TOP_LIKES[d]
-        counters["favorites"]  += TOP_FAVS[d]
+        counters["views"]      += TOP_LISTINGS.get(d, Counter())
+        counters["likes"]      += TOP_LIKES.get(d, Counter())
+        counters["favorites"]  += TOP_FAVS.get(d, Counter())
     txt = [
         "🏆 ТОП за 7 дней:",
         "Просмотры: " + (", ".join([f"{k}:{n}" for k,n in counters["views"].most_common(10)]) or "—"),
