@@ -13,11 +13,11 @@ import time
 import re
 from urllib.parse import urlencode
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton, 
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto
+    InputMediaPhoto, CallbackQuery
 )
 from aiogram.filters import Command, CommandStart
 from aiogram.enums import ParseMode
@@ -685,7 +685,7 @@ class TelegramAdsBot:
             
             # Смена языка
             @self.router.callback_query(F.data.startswith("lang:"))
-            async def handle_lang_callback(callback: types.CallbackQuery):
+            async def handle_lang_callback(callback: CallbackQuery):
                 lang = callback.data.split(":")[1]
                 if lang not in ["ru", "en", "ka"]:
                     lang = "ru"
@@ -802,7 +802,7 @@ class TelegramAdsBot:
             
             # Обработка выбора
             @self.router.callback_query(F.data.startswith("choice:"))
-            async def handle_choice(callback: types.CallbackQuery, state: FSMContext):
+            async def handle_choice(callback: CallbackQuery, state: FSMContext):
                 try:
                     _, field, idx_str = callback.data.split(":")
                     idx = int(idx_str)
@@ -874,7 +874,7 @@ class TelegramAdsBot:
             
             # Обработка выбора комнат
             @self.router.callback_query(F.data.startswith("rooms:"), Search.rooms)
-            async def handle_rooms(callback: types.CallbackQuery, state: FSMContext):
+            async def handle_rooms(callback: CallbackQuery, state: FSMContext):
                 rooms_val = callback.data.split(":")[1]
                 lang = self._get_user_lang(callback.from_user.id)
                 
@@ -916,7 +916,7 @@ class TelegramAdsBot:
             
             # Обработка выбора цены
             @self.router.callback_query(F.data.startswith("price:"), Search.price)
-            async def handle_price(callback: types.CallbackQuery, state: FSMContext):
+            async def handle_price(callback: CallbackQuery, state: FSMContext):
                 price_range = callback.data.split(":")[1]
                 user_id = callback.from_user.id
                 lang = self._get_user_lang(user_id)
@@ -1005,7 +1005,7 @@ class TelegramAdsBot:
                 kb.row(InlineKeyboardButton(t(lang, "btn_home"), callback_data="home"))
                 
                 # Отправляем сообщение
-                if isinstance(message_or_callback, types.CallbackQuery):
+                if isinstance(message_or_callback, CallbackQuery):
                     message = message_or_callback.message
                     try:
                         if photos:
@@ -1038,7 +1038,7 @@ class TelegramAdsBot:
             
             # Навигация по карточкам
             @self.router.callback_query(F.data.startswith("nav:"))
-            async def handle_navigation(callback: types.CallbackQuery):
+            async def handle_navigation(callback: CallbackQuery):
                 user_id = callback.from_user.id
                 action = callback.data.split(":")[1]
                 
@@ -1056,7 +1056,7 @@ class TelegramAdsBot:
             
             # Действия с карточками
             @self.router.callback_query(F.data.startswith("action:"))
-            async def handle_actions(callback: types.CallbackQuery):
+            async def handle_actions(callback: CallbackQuery):
                 user_id = callback.from_user.id
                 action = callback.data.split(":")[1]
                 lang = self._get_user_lang(user_id)
@@ -1134,7 +1134,7 @@ class TelegramAdsBot:
             
             # Кнопка "Назад"
             @self.router.callback_query(F.data == "home")
-            async def handle_home(callback: types.CallbackQuery, state: FSMContext):
+            async def handle_home(callback: CallbackQuery, state: FSMContext):
                 lang = self._get_user_lang(callback.from_user.id)
                 await state.finish()
                 await callback.message.edit_text(t(lang, "menu_title"), reply_markup=main_menu(lang))
