@@ -1,5 +1,5 @@
-# LivePlace Telegram Bot — ULTRA STABLE v5.0
-# Полностью переработан для максимальной стабильности
+# LivePlace Telegram Bot — ULTRA STABLE v6.0
+# Абсолютная защита от конфликтов
 
 import os
 import re
@@ -12,6 +12,7 @@ import json
 import hashlib
 import sys
 import fcntl
+import subprocess
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from time import monotonic
 from datetime import datetime, timedelta
@@ -32,25 +33,70 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-# ===== КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ ДЛЯ СТАБИЛЬНОСТИ =====
+# ===== АГРЕССИВНАЯ ЗАЩИТА ОТ КОНФЛИКТОВ =====
 
-class SingleInstance:
-    """Гарантирует запуск только одного экземпляра бота"""
-    def __init__(self, lockfile="/tmp/liveplace_bot.lock"):
+def kill_all_bot_instances():
+    """Убиваем ВСЕ процессы Python чтобы гарантировать отсутствие конфликтов"""
+    logger.info("🔫 Убиваем все возможные процессы бота...")
+    
+    try:
+        # Получаем текущий PID
+        current_pid = os.getpid()
+        current_script = os.path.abspath(__file__)
+        
+        # Ищем все процессы Python
+        result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+        lines = result.stdout.split('\n')
+        
+        killed_count = 0
+        for line in lines:
+            if 'python' in line and current_script in line:
+                parts = line.split()
+                if len(parts) > 1:
+                    pid = parts[1]
+                    # Не убиваем текущий процесс
+                    if pid != str(current_pid):
+                        try:
+                            os.kill(int(pid), 9)
+                            logger.info(f"✅ Убит процесс PID {pid}")
+                            killed_count += 1
+                        except (ProcessLookupError, ValueError):
+                            pass
+        
+        logger.info(f"✅ Убито процессов: {killed_count}")
+        # Даем время системе очистить процессы
+        time.sleep(2)
+        
+    except Exception as e:
+        logger.warning(f"Ошибка при очистке процессов: {e}")
+
+class AtomicLock:
+    """Атомарная блокировка с гарантией единственного экземпляра"""
+    def __init__(self, lockfile="/tmp/liveplace_atomic.lock"):
         self.lockfile = lockfile
         self.fp = None
         
     def __enter__(self):
+        # Сначала убиваем все возможные конкурирующие процессы
+        kill_all_bot_instances()
+        
+        # Затем создаем атомарную блокировку
+        self.fp = open(self.lockfile, 'w')
         try:
-            self.fp = open(self.lockfile, 'w')
             fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            logger.info("🔒 Атомарная блокировка установлена")
             return self
         except IOError:
-            logger.error("❌ Бот уже запущен в другом процессе! Останавливаем этот экземпляр.")
-            # Записываем PID текущего процесса в файл для отладки
-            with open("/tmp/liveplace_current_pid.txt", "w") as f:
-                f.write(f"Current PID: {os.getpid()}\n")
-            sys.exit(1)
+            logger.error("❌ Не удалось получить блокировку. Другой экземпляр активен.")
+            # Ждем и пробуем еще раз
+            time.sleep(3)
+            try:
+                fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                logger.info("🔒 Блокировка получена после ожидания")
+                return self
+            except IOError:
+                logger.critical("💥 Критический конфликт! Завершаем работу.")
+                sys.exit(1)
         
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.fp:
@@ -58,42 +104,14 @@ class SingleInstance:
                 fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
                 self.fp.close()
                 os.unlink(self.lockfile)
+                logger.info("🔓 Блокировка снята")
             except:
                 pass
 
-# 3. Улучшенная обработка ошибок Telegram
-class RobustBot:
-    """Обертка для бота с улучшенной обработкой ошибок"""
-    def __init__(self, token):
-        from aiogram.client.bot import DefaultBotProperties
-        self.bot = Bot(
-            token=token,
-            default=DefaultBotProperties(parse_mode="HTML")
-        )
-        self.session = None
-        
-    async def ensure_session(self):
-        """Гарантирует активную сессию"""
-        if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession()
-            self.bot.session = self.session
-    
-    async def safe_request(self, method, *args, **kwargs):
-        """Безопасный запрос к Telegram API с повторами"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                await self.ensure_session()
-                result = await method(*args, **kwargs)
-                return result
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise e
-                wait_time = 2 ** attempt
-                logger.warning(f"Ошибка запроса (попытка {attempt+1}): {e}. Ждем {wait_time}сек")
-                await asyncio.sleep(wait_time)
-
 # ===== ИНИЦИАЛИЗАЦИЯ =====
+
+# НАСИЛЬСТВЕННАЯ ОЧИСТКА ПЕРЕД ИМПОРТАМИ
+kill_all_bot_instances()
 
 # Настраиваем логирование
 logging.basicConfig(
@@ -121,14 +139,6 @@ GSHEET_ID           = os.getenv("GSHEET_ID", "").strip()
 GSHEET_TAB          = os.getenv("GSHEET_TAB", "Ads").strip()
 GSHEET_REFRESH_MIN  = int(os.getenv("GSHEET_REFRESH_MIN", "2"))
 
-UTM_SOURCE          = os.getenv("UTM_SOURCE", "telegram")
-UTM_MEDIUM          = os.getenv("UTM_MEDIUM", "bot")
-UTM_CAMPAIGN        = os.getenv("UTM_CAMPAIGN", "bot_ads")
-
-GSHEET_STATS_ID     = os.getenv("GSHEET_STATS_ID", "").strip()
-WEEKLY_REPORT_DOW   = int(os.getenv("WEEKLY_REPORT_DOW", "1") or "1")
-WEEKLY_REPORT_HOUR  = int(os.getenv("WEEKLY_REPORT_HOUR", "9") or "9")
-
 if not API_TOKEN:
     raise RuntimeError("API_TOKEN is not set")
 
@@ -141,9 +151,14 @@ if ADMIN_CHAT_ID:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS_SET
 
-# ---- Bot with robustness
-robust_bot = RobustBot(API_TOKEN)
-bot = robust_bot.bot
+# ---- Bot initialization
+from aiogram.client.bot import DefaultBotProperties
+
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
+
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
@@ -157,7 +172,7 @@ if not os.path.exists(CREDS_FILE):
 creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
 gc    = gspread.authorize(creds)
 
-# ---------- Google Sheets helpers (sync) ----------
+# ---------- Google Sheets helpers ----------
 def open_spreadsheet():
     try:
         return gc.open_by_key(GSHEET_ID)
@@ -206,7 +221,6 @@ def load_rows(force: bool = False) -> List[Dict[str, Any]]:
     _cache_loaded_at = monotonic()
     return rows
 
-# Async wrappers for Sheets I/O
 async def rows_async(force: bool=False) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(load_rows, force)
 
@@ -312,18 +326,15 @@ def t(lang: str, key: str, **kwargs) -> str:
 def current_lang_for(uid: int) -> str:
     return USER_LANG.get(uid, "ru") if uid in USER_LANG else "ru"
 
-def cta_text(lang: str) -> str:
-    return {"ru":"👉 Подробнее","en":"👉 Learn more","ka":"👉 დაწვრილებით"}.get(lang, "👉 Подробнее")
-
 def build_utm_url(raw: str, ad_id: str, uid: int) -> str:
     if not raw:
         return "https://liveplace.com.ge/"
     seed = f"{uid}:{datetime.utcnow().strftime('%Y%m%d')}:{ad_id}".encode("utf-8")
     token = hashlib.sha256(seed).hexdigest()[:16]
     u = urlparse(raw); q = parse_qs(u.query)
-    q["utm_source"]   = [UTM_SOURCE]
-    q["utm_medium"]   = [UTM_MEDIUM]
-    q["utm_campaign"] = [UTM_CAMPAIGN]
+    q["utm_source"]   = ["telegram"]
+    q["utm_medium"]   = ["bot"]
+    q["utm_campaign"] = ["bot_ads"]
     q["utm_content"]  = [ad_id]
     q["token"]        = [token]
     new_q = urlencode({k: v[0] for k, v in q.items()})
@@ -512,7 +523,7 @@ async def _auto_refresh_loop():
                 logger.info("Sheets cache refreshed")
         except Exception as e:
             logger.warning(f"Auto refresh failed: {e}")
-        await asyncio.sleep(60)  # Увеличено до 60 секунд
+        await asyncio.sleep(60)
 
 # ===== ОСНОВНЫЕ ОБРАБОТЧИКИ =====
 @dp.message(Command("start", "menu"))
@@ -538,7 +549,6 @@ async def on_fast(message: Message):
     except Exception as e:
         return await message.answer(f"Ошибка загрузки данных: {e}")
     
-    # Берем последние 30 объявлений
     rows_sorted = sorted(rows, key=lambda x: x.get("published", ""), reverse=True)
     USER_RESULTS[message.from_user.id] = {"rows": rows_sorted[:30], "idx": 0, "context": {}}
     
@@ -556,7 +566,6 @@ async def on_latest(message: Message):
     except Exception as e:
         return await message.answer(f"Ошибка загрузки данных: {e}")
     
-    # Фильтруем последние 7 дней
     now = datetime.now()
     filtered_rows = []
     for row in rows:
@@ -960,22 +969,17 @@ async def on_startup():
     asyncio.create_task(_auto_refresh_loop())
     logger.info("✅ Bot started successfully")
 
-async def on_shutdown():
-    logger.info("🛑 Bot shutting down...")
-    if robust_bot.session:
-        await robust_bot.session.close()
-
 # ===== ГЛАВНЫЙ ЗАПУСК =====
 async def main():
-    with SingleInstance():  # Гарантия одного экземпляра
+    with AtomicLock():  # АГРЕССИВНАЯ БЛОКИРОВКА
         await on_startup()
         try:
             logger.info("🔄 Starting polling...")
             await dp.start_polling(bot, skip_updates=True)
         except Exception as e:
             logger.critical(f"❌ Polling failed: {e}")
-        finally:
-            await on_shutdown()
+            # Принудительно завершаем работу
+            sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
