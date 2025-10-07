@@ -5,10 +5,8 @@ import sys
 import asyncio
 import signal
 import gspread
-import aiohttp
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
-from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -19,7 +17,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from google.oauth2.service_account import Credentials
-from google.auth.transport.requests import Request
 from dotenv import load_dotenv
 import random
 import time
@@ -94,7 +91,6 @@ class TelegramAdsBot:
         self.stats_sheet = None
         self.is_running = False
         self.start_time = None
-        self.session: Optional[aiohttp.ClientSession] = None
         self.ads_cache = []
         self.last_cache_update = None
         self.user_last_ad = {}  # {user_id: timestamp}
@@ -156,24 +152,6 @@ class TelegramAdsBot:
             
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-    
-    async def _create_aiohttp_session(self):
-        """Создание aiohttp сессии"""
-        try:
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(timeout=timeout)
-            self.logger.info("✅ aiohttp сессия создана")
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка создания aiohttp сессии: {e}")
-    
-    async def _close_aiohttp_session(self):
-        """Закрытие aiohttp сессии"""
-        try:
-            if self.session and not self.session.closed:
-                await self.session.close()
-                self.logger.info("✅ aiohttp сессия закрыта")
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка закрытия aiohttp сессии: {e}")
     
     def _setup_google_sheets(self):
         """Настройка подключения к Google Sheets"""
@@ -255,10 +233,11 @@ class TelegramAdsBot:
             button_url = ad.get('button_url', '')
             
             # Добавляем UTM параметры к URL
-            if button_url and any(param in button_url for param in ['?', '&']):
-                button_url += f"&utm_source={UTM_SOURCE}&utm_medium={UTM_MEDIUM}&utm_campaign={UTM_CAMPAIGN}"
-            else:
-                button_url += f"?utm_source={UTM_SOURCE}&utm_medium={UTM_MEDIUM}&utm_campaign={UTM_CAMPAIGN}"
+            if button_url:
+                if any(param in button_url for param in ['?', '&']):
+                    button_url += f"&utm_source={UTM_SOURCE}&utm_medium={UTM_MEDIUM}&utm_campaign={UTM_CAMPAIGN}"
+                else:
+                    button_url += f"?utm_source={UTM_SOURCE}&utm_medium={UTM_MEDIUM}&utm_campaign={UTM_CAMPAIGN}"
             
             keyboard = None
             if button_text and button_url:
@@ -266,13 +245,21 @@ class TelegramAdsBot:
                     [InlineKeyboardButton(text=button_text, url=button_url)]
                 ])
             
-            if image_url:
-                await self.bot.send_photo(
-                    user_id,
-                    image_url,
-                    caption=text,
-                    reply_markup=keyboard
-                )
+            if image_url and image_url.strip():
+                try:
+                    await self.bot.send_photo(
+                        user_id,
+                        image_url,
+                        caption=text,
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Не удалось отправить изображение, отправляем текст: {e}")
+                    await self.bot.send_message(
+                        user_id,
+                        text,
+                        reply_markup=keyboard
+                    )
             else:
                 await self.bot.send_message(
                     user_id,
@@ -339,10 +326,10 @@ Username: @{user_data.get('username', 'N/A')}
         try:
             self.logger.info("🤖 Создаем экземпляр бота...")
             
+            # ИСПРАВЛЕНИЕ: убрана передача session в Bot
             self.bot = Bot(
                 token=API_TOKEN,
-                default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-                session=self.session
+                default=DefaultBotProperties(parse_mode=ParseMode.HTML)
             )
             
             me = await self.bot.get_me()
@@ -784,7 +771,7 @@ GSHEET_REFRESH_MIN: {GSHEET_REFRESH_MIN}
         try:
             if not self.start_time:
                 return "N/A"
-            uptime = asyncio.get_event_loop().time() - self.start_time
+            uptime = time.time() - self.start_time
             hours = int(uptime // 3600)
             minutes = int((uptime % 3600) // 60)
             seconds = int(uptime % 60)
@@ -795,7 +782,6 @@ GSHEET_REFRESH_MIN: {GSHEET_REFRESH_MIN}
     async def _get_ping(self):
         """Получение ping до серверов Telegram"""
         try:
-            import time
             start_time = time.time()
             await self.bot.get_me()
             ping_time = (time.time() - start_time) * 1000
@@ -899,7 +885,6 @@ GSHEET_REFRESH_MIN: {GSHEET_REFRESH_MIN}
                 return False
             
             self._setup_signal_handlers()
-            await self._create_aiohttp_session()
             
             if not await self._create_bot_instance():
                 return False
@@ -910,7 +895,7 @@ GSHEET_REFRESH_MIN: {GSHEET_REFRESH_MIN}
             self._create_dispatcher()
             self._setup_handlers()
             
-            self.start_time = asyncio.get_event_loop().time()
+            self.start_time = time.time()
             self.is_running = True
             
             # Обновляем кэш при старте
@@ -943,11 +928,10 @@ GSHEET_REFRESH_MIN: {GSHEET_REFRESH_MIN}
                 await self.dp.stop_polling()
                 self.logger.info("✅ Polling остановлен")
             
+            # ИСПРАВЛЕНИЕ: правильное закрытие сессии бота
             if self.bot:
                 await self.bot.session.close()
                 self.logger.info("✅ Сессия бота закрыта")
-            
-            await self._close_aiohttp_session()
             
             self.logger.info("✅ Все ресурсы освобождены")
             
@@ -960,7 +944,6 @@ GSHEET_REFRESH_MIN: {GSHEET_REFRESH_MIN}
             await asyncio.gather(*tasks, return_exceptions=True)
             
             self.logger.info("👋 Бот завершил работу")
-            os._exit(0)
 
 async def main():
     """Основная асинхронная функция"""
