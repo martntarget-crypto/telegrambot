@@ -12,6 +12,7 @@ import random
 import time
 import re
 from urllib.parse import urlencode
+import subprocess
 
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.types import (
@@ -304,16 +305,20 @@ def build_utm_url(raw: str, ad_id: str, uid: int) -> str:
 
 def main_menu(lang: str) -> ReplyKeyboardMarkup:
     """Главное меню"""
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton(t(lang, "btn_fast")))
-    kb.row(
-        KeyboardButton(t(lang, "btn_search")), 
-        KeyboardButton(t(lang, "btn_latest"))
-    )
-    kb.add(KeyboardButton(t(lang, "btn_favs")))
-    kb.add(
-        KeyboardButton(t(lang, "btn_language")), 
-        KeyboardButton(t(lang, "btn_about"))
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t(lang, "btn_fast"))],
+            [
+                KeyboardButton(text=t(lang, "btn_search")), 
+                KeyboardButton(text=t(lang, "btn_latest"))
+            ],
+            [KeyboardButton(text=t(lang, "btn_favs"))],
+            [
+                KeyboardButton(text=t(lang, "btn_language")), 
+                KeyboardButton(text=t(lang, "btn_about"))
+            ]
+        ],
+        resize_keyboard=True
     )
     return kb
 
@@ -373,6 +378,31 @@ class TelegramAdsBot:
         except Exception as e:
             print(f"❌ Критическая ошибка инициализации логгера: {e}")
             sys.exit(1)
+    
+    def _kill_old_instances(self):
+        """Убиваем старые процессы бота"""
+        try:
+            self.logger.info("🔫 Убиваем старые процессы бота...")
+            
+            # Для Linux-based систем
+            if sys.platform in ['linux', 'darwin']:
+                subprocess.run([
+                    'pkill', '-f', 'python.*bot.py'
+                ], capture_output=True, timeout=10)
+                
+            # Для Windows
+            elif sys.platform == 'win32':
+                subprocess.run([
+                    'taskkill', '/F', '/IM', 'python.exe', '/T'
+                ], capture_output=True, timeout=10)
+                
+            time.sleep(2)  # Даем время на завершение процессов
+            self.logger.info("✅ Старые процессы бота завершены")
+            
+        except subprocess.TimeoutExpired:
+            self.logger.warning("⚠️ Таймаут при завершении процессов")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка при завершении процессов: {e}")
     
     def _validate_config(self):
         """Проверка конфигурации"""
@@ -450,12 +480,31 @@ class TelegramAdsBot:
             
             records = self.ads_sheet.get_all_records()
             
+            # Временная отладка: выводим первые 2 записи
+            if records and len(records) > 0:
+                self.logger.info(f"📊 Первые 2 записи из таблицы: {records[:2]}")
+            
             # Разделяем на свойства и рекламные объявления
-            self.properties_cache = [record for record in records if record.get('active', '') == '1']
-            self.ads_cache = [record for record in records if record.get('ad_active', '') == '1']
+            # Используем более гибкую фильтрацию для отладки
+            self.properties_cache = []
+            self.ads_cache = []
+            
+            for record in records:
+                # Для свойств: активные объявления
+                if str(record.get('active', '')).strip().lower() in ['1', 'true', 'yes', 'да']:
+                    self.properties_cache.append(record)
+                
+                # Для рекламы: активные рекламные объявления  
+                if str(record.get('ad_active', '')).strip().lower() in ['1', 'true', 'yes', 'да']:
+                    self.ads_cache.append(record)
             
             self.last_cache_update = datetime.now()
             self.logger.info(f"✅ Кэш обновлен: {len(self.properties_cache)} свойств, {len(self.ads_cache)} рекламных объявлений")
+            
+            # Если свойств нет, попробуем загрузить все записи для отладки
+            if len(self.properties_cache) == 0 and len(records) > 0:
+                self.logger.warning("⚠️ Нет активных свойств, загружаем все записи для отладки")
+                self.properties_cache = records[:10]  # Берем первые 10 для теста
             
         except Exception as e:
             self.logger.error(f"❌ Ошибка обновления кэша: {e}")
@@ -691,7 +740,8 @@ class TelegramAdsBot:
                     lang = "ru"
                 
                 self.user_lang[callback.from_user.id] = lang
-                await callback.message.edit_text(t(lang, "menu_title"), reply_markup=main_menu(lang))
+                await callback.message.edit_text(t(lang, "menu_title"))
+                await callback.message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
                 await callback.answer()
             
             # Кнопка "Быстрый подбор"
@@ -703,18 +753,21 @@ class TelegramAdsBot:
                 # Обновляем кэш
                 self._refresh_cache()
                 
+                if not self.properties_cache:
+                    await message.answer(t(lang, "no_results"))
+                    return
+                
                 # Сортируем по дате публикации (новые first)
                 def get_pub_date(row):
                     try:
-                        return datetime.fromisoformat(str(row.get("published", "")))
+                        pub_date = row.get("published", "")
+                        if isinstance(pub_date, str):
+                            return datetime.fromisoformat(pub_date)
+                        return datetime.min
                     except:
                         return datetime.min
                 
                 sorted_properties = sorted(self.properties_cache, key=get_pub_date, reverse=True)[:30]
-                
-                if not sorted_properties:
-                    await message.answer(t(lang, "no_results"))
-                    return
                 
                 self.user_results[user_id] = {
                     "rows": sorted_properties,
@@ -730,19 +783,23 @@ class TelegramAdsBot:
             async def handle_search(message: Message, state: FSMContext):
                 lang = self._get_user_lang(message.from_user.id)
                 
-                kb = ReplyKeyboardMarkup(resize_keyboard=True)
-                kb.row(
-                    KeyboardButton(t(lang, "btn_rent")),
-                    KeyboardButton(t(lang, "btn_sale")),
-                    KeyboardButton(t(lang, "btn_daily"))
-                )
-                kb.row(
-                    KeyboardButton(t(lang, "btn_latest")),
-                    KeyboardButton(t(lang, "btn_fast"))
-                )
-                kb.row(
-                    KeyboardButton(t(lang, "btn_language")),
-                    KeyboardButton(t(lang, "btn_home"))
+                kb = ReplyKeyboardMarkup(
+                    keyboard=[
+                        [
+                            KeyboardButton(text=t(lang, "btn_rent")),
+                            KeyboardButton(text=t(lang, "btn_sale")),
+                            KeyboardButton(text=t(lang, "btn_daily"))
+                        ],
+                        [
+                            KeyboardButton(text=t(lang, "btn_latest")),
+                            KeyboardButton(text=t(lang, "btn_fast"))
+                        ],
+                        [
+                            KeyboardButton(text=t(lang, "btn_language")),
+                            KeyboardButton(text=t(lang, "btn_home"))
+                        ]
+                    ],
+                    resize_keyboard=True
                 )
                 
                 await Search.mode.set()
@@ -773,6 +830,7 @@ class TelegramAdsBot:
                 
                 if not cities:
                     await message.answer("Нет доступных городов для выбранного режима")
+                    await state.finish()
                     return
                 
                 await Search.city.set()
@@ -967,7 +1025,10 @@ class TelegramAdsBot:
                 idx = user_data.get("idx", 0)
                 
                 if not rows:
-                    await message_or_callback.answer(t(lang, "no_results"))
+                    if isinstance(message_or_callback, CallbackQuery):
+                        await message_or_callback.message.answer(t(lang, "no_results"))
+                    else:
+                        await message_or_callback.answer(t(lang, "no_results"))
                     return
                 
                 row = rows[idx]
@@ -997,7 +1058,7 @@ class TelegramAdsBot:
                 )
                 
                 # Избранное
-                fav_key = f"{row.get('city')}_{row.get('district')}_{row.get('type')}_{row.get('price')}"
+                fav_key = f"{row.get('city', '')}_{row.get('district', '')}_{row.get('type', '')}_{row.get('price', '')}"
                 is_fav = fav_key in self.user_favs.get(user_id, [])
                 fav_text = t(lang, "btn_fav_del") if is_fav else t(lang, "btn_fav_add")
                 kb.row(InlineKeyboardButton(fav_text, callback_data="action:fav"))
@@ -1013,28 +1074,32 @@ class TelegramAdsBot:
                             media = []
                             for i, photo_url in enumerate(photos[:10]):
                                 if i == 0:
-                                    media.append(InputMediaPhoto(media=photo_url, caption=text))
+                                    media.append(InputMediaPhoto(media=photo_url, caption=text, parse_mode="HTML"))
                                 else:
                                     media.append(InputMediaPhoto(media=photo_url))
                             await message.answer_media_group(media)
                             await message.answer("📍", reply_markup=kb)
                         else:
-                            await message.edit_text(text, reply_markup=kb)
+                            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
                     except Exception as e:
                         self.logger.warning(f"Не удалось отправить фото: {e}")
-                        await message.edit_text(text, reply_markup=kb)
+                        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
                 else:
                     if photos:
-                        media = []
-                        for i, photo_url in enumerate(photos[:10]):
-                            if i == 0:
-                                media.append(InputMediaPhoto(media=photo_url, caption=text))
-                            else:
-                                media.append(InputMediaPhoto(media=photo_url))
-                        await message_or_callback.answer_media_group(media)
-                        await message_or_callback.answer("📍", reply_markup=kb)
+                        try:
+                            media = []
+                            for i, photo_url in enumerate(photos[:10]):
+                                if i == 0:
+                                    media.append(InputMediaPhoto(media=photo_url, caption=text, parse_mode="HTML"))
+                                else:
+                                    media.append(InputMediaPhoto(media=photo_url))
+                            await message_or_callback.answer_media_group(media)
+                            await message_or_callback.answer("📍", reply_markup=kb)
+                        except Exception as e:
+                            self.logger.warning(f"Не удалось отправить медиагруппу: {e}")
+                            await message_or_callback.answer(text, reply_markup=kb, parse_mode="HTML")
                     else:
-                        await message_or_callback.answer(text, reply_markup=kb)
+                        await message_or_callback.answer(text, reply_markup=kb, parse_mode="HTML")
             
             # Навигация по карточкам
             @self.router.callback_query(F.data.startswith("nav:"))
@@ -1087,7 +1152,7 @@ class TelegramAdsBot:
                 
                 elif action == "fav":
                     # Избранное
-                    fav_key = f"{row.get('city')}_{row.get('district')}_{row.get('type')}_{row.get('price')}"
+                    fav_key = f"{row.get('city', '')}_{row.get('district', '')}_{row.get('type', '')}_{row.get('price', '')}"
                     
                     if user_id not in self.user_favs:
                         self.user_favs[user_id] = []
@@ -1115,7 +1180,7 @@ class TelegramAdsBot:
                 # Находим свойства по ключам
                 fav_properties = []
                 for prop in self.properties_cache:
-                    prop_key = f"{prop.get('city')}_{prop.get('district')}_{prop.get('type')}_{prop.get('price')}"
+                    prop_key = f"{prop.get('city', '')}_{prop.get('district', '')}_{prop.get('type', '')}_{prop.get('price', '')}"
                     if prop_key in fav_keys:
                         fav_properties.append(prop)
                 
@@ -1137,7 +1202,8 @@ class TelegramAdsBot:
             async def handle_home(callback: CallbackQuery, state: FSMContext):
                 lang = self._get_user_lang(callback.from_user.id)
                 await state.finish()
-                await callback.message.edit_text(t(lang, "menu_title"), reply_markup=main_menu(lang))
+                await callback.message.edit_text(t(lang, "menu_title"))
+                await callback.message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
                 await callback.answer()
             
             # Обработка текстовых сообщений (лиды)
@@ -1195,6 +1261,9 @@ Username: @{user.username or 'N/A'}
         """Запуск бота"""
         try:
             self.logger.info("🚀 Запускаем бота...")
+            
+            # Убиваем старые процессы перед запуском
+            self._kill_old_instances()
             
             if not self._validate_config():
                 return False
