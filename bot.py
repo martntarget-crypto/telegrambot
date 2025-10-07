@@ -4,36 +4,84 @@ import os
 import sys
 import asyncio
 import signal
-from datetime import datetime
-from typing import Optional
+import gspread
+import aiohttp
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Any
+from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, CommandStart
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
-import aiohttp
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
 from dotenv import load_dotenv
+import random
+import time
 
-# ===== КОНФИГУРАЦИЯ =====
+# ===== ЗАГРУЗКА КОНФИГУРАЦИИ =====
 load_dotenv()
 
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-if not BOT_TOKEN:
-    print("❌ BOT_TOKEN не установлен в переменных окружения")
+# Telegram настройки
+API_TOKEN = os.getenv('API_TOKEN')
+if not API_TOKEN:
+    print("❌ API_TOKEN не установлен в переменных окружения")
     sys.exit(1)
 
 try:
-    ADMIN_IDS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
-except (ValueError, AttributeError):
-    ADMIN_IDS = []
+    ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '0'))
+    FEEDBACK_CHAT_ID = int(os.getenv('FEEDBACK_CHAT_ID', '0'))
+except (ValueError, TypeError):
+    ADMIN_CHAT_ID = 0
+    FEEDBACK_CHAT_ID = 0
+
+# Google Sheets настройки
+GSHEET_ID = os.getenv('GSHEET_ID')
+GSHEET_TAB = os.getenv('GSHEET_TAB', 'Ads')
+try:
+    GSHEET_REFRESH_MIN = int(os.getenv('GSHEET_REFRESH_MIN', '2'))
+except (ValueError, TypeError):
+    GSHEET_REFRESH_MIN = 2
+
+GSHEET_STATS_ID = os.getenv('GSHEET_STATS_ID')
+
+# Настройки отчетов
+try:
+    WEEKLY_REPORT_DOW = int(os.getenv('WEEKLY_REPORT_DOW', '1'))
+    WEEKLY_REPORT_HOUR = int(os.getenv('WEEKLY_REPORT_HOUR', '9'))
+except (ValueError, TypeError):
+    WEEKLY_REPORT_DOW = 1
+    WEEKLY_REPORT_HOUR = 9
+
+# Настройки рекламы
+ADS_ENABLED = os.getenv('ADS_ENABLED', '0') == '1'
+try:
+    ADS_PROB = float(os.getenv('ADS_PROB', '0.18'))
+    ADS_COOLDOWN_SEC = int(os.getenv('ADS_COOLDOWN_SEC', '180'))
+except (ValueError, TypeError):
+    ADS_PROB = 0.18
+    ADS_COOLDOWN_SEC = 180
+
+# UTM метки
+UTM_SOURCE = os.getenv('UTM_SOURCE', 'telegram')
+UTM_MEDIUM = os.getenv('UTM_MEDIUM', 'bot')
+UTM_CAMPAIGN = os.getenv('UTM_CAMPAIGN', 'bot_ads')
 
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
-# =========================
 
-class AdvancedBotManager:
-    """Продвинутый менеджер бота с полной обработкой ошибок"""
+# ===== КЛАССЫ СОСТОЯНИЙ =====
+class UserStates(StatesGroup):
+    waiting_for_feedback = State()
+    waiting_for_contact = State()
+
+# ===== ОСНОВНОЙ КЛАСС БОТА =====
+class TelegramAdsBot:
+    """Продвинутый бот для управления рекламой в Telegram с Google Sheets"""
     
     def __init__(self):
         self._setup_logging()
@@ -41,36 +89,36 @@ class AdvancedBotManager:
         self.dp: Optional[Dispatcher] = None
         self.router: Optional[Router] = None
         self.storage: Optional[MemoryStorage] = None
+        self.gc: Optional[gspread.Client] = None
+        self.ads_sheet = None
+        self.stats_sheet = None
         self.is_running = False
         self.start_time = None
         self.session: Optional[aiohttp.ClientSession] = None
+        self.ads_cache = []
+        self.last_cache_update = None
+        self.user_last_ad = {}  # {user_id: timestamp}
         
     def _setup_logging(self):
-        """Настройка системы логирования - В САМОМ НАЧАЛЕ!"""
+        """Настройка системы логирования"""
         try:
-            # Устанавливаем уровень логирования
             log_level = getattr(logging, LOG_LEVEL, logging.INFO)
             
-            # Создаем форматтер
             formatter = logging.Formatter(
                 '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                 datefmt='%Y-%m-%d %H:%M:%S'
             )
             
-            # Настраиваем корневой логгер
             logger = logging.getLogger()
             logger.setLevel(log_level)
             
-            # Очищаем существующие обработчики
             for handler in logger.handlers[:]:
                 logger.removeHandler(handler)
             
-            # Добавляем консольный обработчик
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setFormatter(formatter)
             logger.addHandler(console_handler)
             
-            # Добавляем файловый обработчик
             file_handler = logging.FileHandler('bot.log', encoding='utf-8')
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
@@ -84,12 +132,18 @@ class AdvancedBotManager:
     
     def _validate_config(self):
         """Проверка конфигурации"""
-        if not BOT_TOKEN:
-            self.logger.error("❌ BOT_TOKEN не установлен")
+        if not API_TOKEN:
+            self.logger.error("❌ API_TOKEN не установлен")
             return False
             
-        if not ADMIN_IDS:
-            self.logger.warning("⚠️ ADMIN_IDS не установлены, админские команды недоступны")
+        if not ADMIN_CHAT_ID:
+            self.logger.warning("⚠️ ADMIN_CHAT_ID не установлен, админские функции недоступны")
+            
+        if not FEEDBACK_CHAT_ID:
+            self.logger.warning("⚠️ FEEDBACK_CHAT_ID не установлен, лиды не будут пересылаться")
+            
+        if not GSHEET_ID:
+            self.logger.warning("⚠️ GSHEET_ID не установлен, работа с Google Sheets отключена")
             
         self.logger.info("✅ Конфигурация проверена успешно")
         return True
@@ -121,19 +175,176 @@ class AdvancedBotManager:
         except Exception as e:
             self.logger.error(f"❌ Ошибка закрытия aiohttp сессии: {e}")
     
+    def _setup_google_sheets(self):
+        """Настройка подключения к Google Sheets"""
+        try:
+            if not GSHEET_ID:
+                self.logger.warning("⚠️ GSHEET_ID не указан, пропускаем настройку Google Sheets")
+                return True
+                
+            # Используем service account из переменных окружения
+            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+            
+            # Попробуем получить credentials из env
+            creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+            if creds_json:
+                import json
+                creds_dict = json.loads(creds_json)
+                creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+            else:
+                # Или из файла
+                creds_file = os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
+                if not os.path.exists(creds_file):
+                    self.logger.warning(f"⚠️ Файл {creds_file} не найден, Google Sheets отключен")
+                    return False
+                creds = Credentials.from_service_account_file(creds_file, scopes=scope)
+            
+            self.gc = gspread.authorize(creds)
+            
+            # Открываем основную таблицу
+            self.ads_sheet = self.gc.open_by_key(GSHEET_ID).worksheet(GSHEET_TAB)
+            self.logger.info(f"✅ Подключение к Google Sheets установлено (лист: {GSHEET_TAB})")
+            
+            # Открываем таблицу статистики если указана
+            if GSHEET_STATS_ID:
+                self.stats_sheet = self.gc.open_by_key(GSHEET_STATS_ID).sheet1
+                self.logger.info("✅ Таблица статистики подключена")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка настройки Google Sheets: {e}")
+            return False
+    
+    def _refresh_ads_cache(self):
+        """Обновление кэша рекламных объявлений"""
+        try:
+            if not self.ads_sheet:
+                return
+                
+            # Проверяем, нужно ли обновлять кэш
+            if (self.last_cache_update and 
+                datetime.now() - self.last_cache_update < timedelta(minutes=GSHEET_REFRESH_MIN)):
+                return
+            
+            records = self.ads_sheet.get_all_records()
+            self.ads_cache = [record for record in records if record.get('active', '') == '1']
+            self.last_cache_update = datetime.now()
+            self.logger.info(f"✅ Кэш объявлений обновлен: {len(self.ads_cache)} активных объявлений")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка обновления кэша объявлений: {e}")
+    
+    def _get_random_ad(self):
+        """Получение случайного рекламного объявления"""
+        if not self.ads_cache:
+            return None
+            
+        return random.choice(self.ads_cache)
+    
+    async def _send_ad_to_user(self, user_id: int, user_name: str):
+        """Отправка рекламного объявления пользователю"""
+        try:
+            ad = self._get_random_ad()
+            if not ad:
+                return False
+            
+            text = ad.get('text', '')
+            image_url = ad.get('image', '')
+            button_text = ad.get('button_text', '')
+            button_url = ad.get('button_url', '')
+            
+            # Добавляем UTM параметры к URL
+            if button_url and any(param in button_url for param in ['?', '&']):
+                button_url += f"&utm_source={UTM_SOURCE}&utm_medium={UTM_MEDIUM}&utm_campaign={UTM_CAMPAIGN}"
+            else:
+                button_url += f"?utm_source={UTM_SOURCE}&utm_medium={UTM_MEDIUM}&utm_campaign={UTM_CAMPAIGN}"
+            
+            keyboard = None
+            if button_text and button_url:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=button_text, url=button_url)]
+                ])
+            
+            if image_url:
+                await self.bot.send_photo(
+                    user_id,
+                    image_url,
+                    caption=text,
+                    reply_markup=keyboard
+                )
+            else:
+                await self.bot.send_message(
+                    user_id,
+                    text,
+                    reply_markup=keyboard
+                )
+            
+            # Логируем показ
+            await self._log_ad_shown(ad, user_id, user_name)
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка отправки рекламы пользователю {user_id}: {e}")
+            return False
+    
+    async def _log_ad_shown(self, ad: Dict, user_id: int, user_name: str):
+        """Логирование показа рекламы"""
+        try:
+            if self.stats_sheet:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                row = [timestamp, str(user_id), user_name, ad.get('id', 'N/A'), ad.get('title', 'N/A')]
+                self.stats_sheet.append_row(row)
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка логирования показа рекламы: {e}")
+    
+    async def _log_lead(self, user_data: Dict, message: str = ""):
+        """Логирование лида в Google Sheets и отправка в чат"""
+        try:
+            # Логируем в Google Sheets если есть таблица статистики
+            if self.stats_sheet:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                row = [
+                    timestamp, 
+                    str(user_data.get('id', '')), 
+                    user_data.get('name', ''),
+                    user_data.get('username', ''),
+                    'LEAD',
+                    message[:100]  # ограничиваем длину сообщения
+                ]
+                self.stats_sheet.append_row(row)
+            
+            # Отправляем уведомление в чат для лидов
+            if FEEDBACK_CHAT_ID:
+                lead_text = f"""
+📥 НОВЫЙ ЛИД
+
+👤 Пользователь:
+ID: {user_data.get('id', 'N/A')}
+Имя: {user_data.get('name', 'N/A')}
+Username: @{user_data.get('username', 'N/A')}
+
+💬 Сообщение:
+{message if message else 'Контакт запрошен'}
+
+🕒 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                """
+                await self.bot.send_message(FEEDBACK_CHAT_ID, lead_text)
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка логирования лида: {e}")
+    
     async def _create_bot_instance(self) -> bool:
         """Создание экземпляра бота с проверкой доступности"""
         try:
             self.logger.info("🤖 Создаем экземпляр бота...")
             
-            # Создаем бота с настройками по умолчанию
             self.bot = Bot(
-                token=BOT_TOKEN,
+                token=API_TOKEN,
                 default=DefaultBotProperties(parse_mode=ParseMode.HTML),
                 session=self.session
             )
             
-            # Проверяем доступность бота
             me = await self.bot.get_me()
             self.logger.info(f"✅ Бот @{me.username} успешно создан и доступен")
             return True
@@ -161,57 +372,261 @@ class AdvancedBotManager:
             @self.router.message(CommandStart())
             async def handle_start(message: Message):
                 try:
-                    self.logger.info(f"👋 Команда /start от пользователя {message.from_user.id}")
+                    user = message.from_user
+                    self.logger.info(f"👋 Команда /start от пользователя {user.id}")
+                    
+                    # Обновляем кэш объявлений
+                    self._refresh_ads_cache()
+                    
+                    # Проверяем и отправляем рекламу если нужно
+                    should_send_ad = False
+                    if ADS_ENABLED:
+                        now = time.time()
+                        last_ad_time = self.user_last_ad.get(user.id, 0)
+                        if now - last_ad_time > ADS_COOLDOWN_SEC and random.random() < ADS_PROB:
+                            should_send_ad = True
+                            self.user_last_ad[user.id] = now
                     
                     markup = ReplyKeyboardMarkup(
                         keyboard=[
-                            [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="🔄 Статус")],
-                            [KeyboardButton(text="📊 Информация")]
+                            [KeyboardButton(text="ℹ️ О нас"), KeyboardButton(text="💼 Услуги")],
+                            [KeyboardButton(text="📞 Связаться"), KeyboardButton(text="🎁 Спецпредложение")],
+                            [KeyboardButton(text="🔄 Статус")]
                         ],
                         resize_keyboard=True
                     )
                     
-                    user = message.from_user
-                    await message.answer(
-                        f"🤖 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
-                        f"👤 <b>Ваш профиль:</b>\n"
-                        f"   ID: <code>{user.id}</code>\n"
-                        f"   Имя: {user.first_name or 'Не указано'}\n"
-                        f"   Фамилия: {user.last_name or 'Не указана'}\n"
-                        f"   Username: @{user.username or 'Не указан'}\n\n"
-                        f"🕒 <b>Время сервера:</b> {self._get_current_time()}\n"
-                        f"📡 <b>Статус бота:</b> 🟢 Активен",
-                        reply_markup=markup
-                    )
+                    welcome_text = f"""
+🤖 <b>Добро пожаловать, {user.first_name}!</b>
+
+Рады приветствовать вас! Я помогу вам узнать о наших услугах и специальных предложениях.
+
+Выберите нужный раздел ниже или используйте команды:
+/help - список команд
+/info - о боте
+"""
+                    await message.answer(welcome_text, reply_markup=markup)
+                    
+                    # Отправляем рекламу после приветствия
+                    if should_send_ad:
+                        await asyncio.sleep(1)
+                        await self._send_ad_to_user(user.id, user.first_name)
+                        
                 except Exception as e:
                     self.logger.error(f"❌ Ошибка в обработчике /start: {e}")
             
             # Команда /help
             @self.router.message(Command("help"))
-            @self.router.message(F.text == "ℹ️ Помощь")
             async def handle_help(message: Message):
                 try:
                     help_text = """
 <b>📚 Доступные команды:</b>
 
-/start - Запуск бота и информация о пользователе
-/help - Список команд и помощь
-/status - Статус системы и бота
-/info - Подробная информация о боте
-/admin - Админ панель (только для админов)
+/start - Начать работу
+/help - Список команд
+/info - О боте
+/status - Статус системы
+/feedback - Оставить отзыв
+/admin - Админ панель
 
 <b>🔧 Основные функции:</b>
-• Мониторинг состояния системы
-• Управление настройками
-• Логирование действий
-• Информация о пользователе
-
-<b>⚡ Быстрые команды через кнопки:</b>
-Используйте кнопки ниже для быстрого доступа к функциям!
-                    """
+• Информация об услугах
+• Связь с менеджером
+• Специальные предложения
+• Автоматические уведомления
+"""
                     await message.answer(help_text)
                 except Exception as e:
                     self.logger.error(f"❌ Ошибка в обработчике /help: {e}")
+            
+            # Команда /feedback
+            @self.router.message(Command("feedback"))
+            async def handle_feedback_command(message: Message, state: FSMContext):
+                try:
+                    await message.answer(
+                        "💬 <b>Оставьте ваш отзыв или предложение:</b>\n\n"
+                        "Напишите сообщение, и мы его обязательно рассмотрим!"
+                    )
+                    await state.set_state(UserStates.waiting_for_feedback)
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка в обработчике /feedback: {e}")
+            
+            # Обработка текста фидбека
+            @self.router.message(UserStates.waiting_for_feedback)
+            async def handle_feedback_text(message: Message, state: FSMContext):
+                try:
+                    user = message.from_user
+                    feedback_text = message.text
+                    
+                    # Логируем фидбек как лид
+                    user_data = {
+                        'id': user.id,
+                        'name': user.first_name,
+                        'username': user.username
+                    }
+                    await self._log_lead(user_data, f"Фидбек: {feedback_text}")
+                    
+                    await message.answer(
+                        "✅ <b>Спасибо за ваш отзыв!</b>\n\n"
+                        "Мы ценим ваше мнение и обязательно его рассмотрим."
+                    )
+                    await state.clear()
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка обработки фидбека: {e}")
+                    await state.clear()
+            
+            # Кнопка "Связаться"
+            @self.router.message(F.text == "📞 Связаться")
+            async def handle_contact(message: Message, state: FSMContext):
+                try:
+                    user = message.from_user
+                    
+                    markup = ReplyKeyboardMarkup(
+                        keyboard=[
+                            [KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)],
+                            [KeyboardButton(text="↩️ Назад")]
+                        ],
+                        resize_keyboard=True
+                    )
+                    
+                    await message.answer(
+                        "📞 <b>Свяжитесь с нами</b>\n\n"
+                        "Нажмите кнопку ниже чтобы отправить номер телефона, "
+                        "и наш менеджер свяжется с вами в ближайшее время!",
+                        reply_markup=markup
+                    )
+                    await state.set_state(UserStates.waiting_for_contact)
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка обработки кнопки связи: {e}")
+            
+            # Обработка контакта
+            @self.router.message(UserStates.waiting_for_contact, F.contact)
+            async def handle_contact_received(message: Message, state: FSMContext):
+                try:
+                    user = message.from_user
+                    contact = message.contact
+                    
+                    # Логируем контакт как лид
+                    user_data = {
+                        'id': user.id,
+                        'name': contact.first_name or user.first_name,
+                        'username': user.username,
+                        'phone': contact.phone_number
+                    }
+                    await self._log_lead(user_data, "Запрос связи (отправлен номер телефона)")
+                    
+                    await message.answer(
+                        "✅ <b>Спасибо! Ваш номер телефона получен.</b>\n\n"
+                        "Наш менеджер свяжется с вами в ближайшее время.",
+                        reply_markup=ReplyKeyboardMarkup(
+                            keyboard=[
+                                [KeyboardButton(text="ℹ️ О нас"), KeyboardButton(text="💼 Услуги")],
+                                [KeyboardButton(text="📞 Связаться"), KeyboardButton(text="🎁 Спецпредложение")]
+                            ],
+                            resize_keyboard=True
+                        )
+                    )
+                    await state.clear()
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка обработки контакта: {e}")
+                    await state.clear()
+            
+            # Кнопка "Назад"
+            @self.router.message(F.text == "↩️ Назад")
+            async def handle_back(message: Message, state: FSMContext):
+                try:
+                    await state.clear()
+                    markup = ReplyKeyboardMarkup(
+                        keyboard=[
+                            [KeyboardButton(text="ℹ️ О нас"), KeyboardButton(text="💼 Услуги")],
+                            [KeyboardButton(text="📞 Связаться"), KeyboardButton(text="🎁 Спецпредложение")],
+                            [KeyboardButton(text="🔄 Статус")]
+                        ],
+                        resize_keyboard=True
+                    )
+                    await message.answer("🔙 Возвращаемся в главное меню", reply_markup=markup)
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка обработки кнопки назад: {e}")
+            
+            # Кнопка "О нас"
+            @self.router.message(F.text == "ℹ️ О нас")
+            async def handle_about(message: Message):
+                try:
+                    about_text = """
+<b>🏢 О нашей компании</b>
+
+Мы профессиональная команда, специализирующаяся на digital-решениях. 
+
+<b>Наши преимущества:</b>
+• Опыт работы более 5 лет
+• 100+ успешных проектов
+• Индивидуальный подход к каждому клиенту
+• Современные технологии и методологии
+
+Узнайте больше о наших услугах или свяжитесь с нами для консультации!
+"""
+                    await message.answer(about_text)
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка обработки кнопки 'О нас': {e}")
+            
+            # Кнопка "Услуги"
+            @self.router.message(F.text == "💼 Услуги")
+            async def handle_services(message: Message):
+                try:
+                    services_text = """
+<b>💼 Наши услуги</b>
+
+<b>🔹 Разработка ботов</b>
+- Telegram, WhatsApp, VK боты
+- Интеграция с CRM и базами данных
+- Автоматизация бизнес-процессов
+
+<b>🔹 Веб-разработка</b>
+- Сайты и веб-приложения
+- Интернет-магазины
+- Корпоративные порталы
+
+<b>🔹 Digital-маркетинг</b>
+- SEO оптимизация
+- Контекстная реклама
+- SMM продвижение
+
+<b>🔹 Автоматизация</b>
+- Интеграция API
+- Скрипты и парсинг данных
+- Бизнес-процессы
+
+Нажмите "Связаться" для консультации!
+"""
+                    await message.answer(services_text)
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка обработки кнопки 'Услуги': {e}")
+            
+            # Кнопка "Спецпредложение"
+            @self.router.message(F.text == "🎁 Спецпредложение")
+            async def handle_special_offer(message: Message):
+                try:
+                    offer_text = """
+<b>🎁 Специальное предложение</b>
+
+🔥 <b>Только для новых клиентов!</b>
+
+При заказе любой услуги до конца месяца получите:
+
+✅ <b>Бесплатную консультацию</b> по оптимизации бизнеса
+✅ <b>Аудит</b> текущих digital-процессов  
+✅ <b>Скидку 15%</b> на первый заказ
+
+Успейте воспользоваться предложением! 🏃💨
+
+Нажмите "Связаться" чтобы узнать подробности!
+"""
+                    await message.answer(offer_text)
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка обработки кнопки 'Спецпредложение': {e}")
             
             # Команда /status
             @self.router.message(Command("status"))
@@ -226,43 +641,47 @@ class AdvancedBotManager:
 💾 <b>Память:</b> {self._get_memory_usage()} MB
 ⏰ <b>Аптайм:</b> {self._get_uptime()}
 📶 <b>Ping:</b> {ping_time} ms
-🖥 <b>Нагрузка:</b> {self._get_system_load()}
-📈 <b>Логов сегодня:</b> {self._get_today_logs_count()}
 
-<b>🌐 Системная информация:</b>
-ОС: {sys.platform}
-Python: {sys.version.split()[0]}
-Aiogram: 3.22.0
-                    """
+<b>📈 Статистика:</b>
+Объявления в кэше: {len(self.ads_cache)}
+Реклама: {'🟢 Вкл' if ADS_ENABLED else '🔴 Выкл'}
+Google Sheets: {'🟢 Подключено' if self.ads_sheet else '🔴 Отключено'}
+
+<b>👥 Пользователи:</b>
+Активных сегодня: {self._get_today_users_count()}
+"""
                     await message.answer(status_text)
                 except Exception as e:
                     self.logger.error(f"❌ Ошибка в обработчике /status: {e}")
             
             # Команда /info
             @self.router.message(Command("info"))
-            @self.router.message(F.text == "📊 Информация")
             async def handle_info(message: Message):
                 try:
                     info_text = f"""
-<b>ℹ️ Информация о боте:</b>
+<b>ℹ️ Информация о боте</b>
 
-<b>Разработчик:</b> AIogram 3.22.0 Bot Framework
 <b>Версия:</b> 2.0.0
+<b>Назначение:</b> Автоматизация рекламы и сбора лидов
 <b>Архитектура:</b> Асинхронная
-<b>Хранилище:</b> Memory Storage
-<b>Логирование:</b> Файловое + Консольное
-
-<b>📊 Статистика:</b>
-Запущен: {self._get_start_time()}
-Обработано сообщений: {self._get_estimated_messages()}
-Файл логов: bot.log ({self._get_log_file_size()})
 
 <b>🔧 Технологии:</b>
 • Aiogram 3.22.0
+• Google Sheets API
 • aiohttp 3.12.15
-• asyncio
-• Python 3.11+
-                    """
+
+<b>⚙️ Настройки:</b>
+Реклама: {'Включена' if ADS_ENABLED else 'Выключена'}
+Вероятность рекламы: {ADS_PROB * 100}%
+Кэш объявлений: {GSHEET_REFRESH_MIN} мин.
+
+<b>📊 Функции:</b>
+✅ Управление рекламой
+✅ Сбор лидов  
+✅ Google Sheets интеграция
+✅ Авто-отчеты
+✅ UTM метки
+"""
                     await message.answer(info_text)
                 except Exception as e:
                     self.logger.error(f"❌ Ошибка в обработчике /info: {e}")
@@ -271,49 +690,69 @@ Aiogram: 3.22.0
             @self.router.message(Command("admin"))
             async def handle_admin(message: Message):
                 try:
-                    if message.from_user.id not in ADMIN_IDS:
+                    if message.from_user.id != ADMIN_CHAT_ID:
                         await message.answer("❌ <b>Доступ запрещен!</b>\n\nЭта команда доступна только администраторам.")
                         return
                     
-                    # Статистика для админов
                     admin_text = f"""
 <b>👨‍💻 Админ панель</b>
 
 <b>📈 Статистика:</b>
-Пользователей в чате: 1
-Всего логов: {self._get_total_logs_count()}
+Активных объявлений: {len(self.ads_cache)}
+Обновление кэша: {self.last_cache_update.strftime('%H:%M:%S') if self.last_cache_update else 'Никогда'}
 Логов сегодня: {self._get_today_logs_count()}
-Размер лог-файла: {self._get_log_file_size()}
 
-<b>🔧 Система:</b>
-ОС: {sys.platform}
-Python: {sys.version.split()[0]}
-Память: {self._get_memory_usage()} MB
-Аптайм: {self._get_uptime()}
+<b>⚙️ Настройки:</b>
+ADS_ENABLED: {ADS_ENABLED}
+ADS_PROB: {ADS_PROB}
+ADS_COOLDOWN_SEC: {ADS_COOLDOWN_SEC}
+GSHEET_REFRESH_MIN: {GSHEET_REFRESH_MIN}
 
-<b>🤖 Бот:</b>
-ID: {(await self.bot.get_me()).id}
-Username: @{(await self.bot.get_me()).username}
-Версия Aiogram: 3.22.0
-
-<b>👥 Администраторы:</b>
-{len(ADMIN_IDS)} пользователей
-                    """
+<b>🔧 Команды админа:</b>
+/update_ads - Обновить кэш объявлений
+/stats - Подробная статистика
+"""
                     await message.answer(admin_text)
                 except Exception as e:
                     self.logger.error(f"❌ Ошибка в обработчике /admin: {e}")
+            
+            # Команда /update_ads
+            @self.router.message(Command("update_ads"))
+            async def handle_update_ads(message: Message):
+                try:
+                    if message.from_user.id != ADMIN_CHAT_ID:
+                        return
+                    
+                    self._refresh_ads_cache()
+                    await message.answer(f"✅ Кэш объявлений обновлен: {len(self.ads_cache)} активных объявлений")
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка в обработчике /update_ads: {e}")
+                    await message.answer("❌ Ошибка обновления кэша")
             
             # Обработка неизвестных сообщений
             @self.router.message()
             async def handle_unknown(message: Message):
                 try:
                     self.logger.info(f"❓ Неизвестное сообщение от {message.from_user.id}: {message.text}")
+                    
+                    # Проверяем и отправляем рекламу если нужно
+                    if ADS_ENABLED:
+                        user = message.from_user
+                        now = time.time()
+                        last_ad_time = self.user_last_ad.get(user.id, 0)
+                        if now - last_ad_time > ADS_COOLDOWN_SEC and random.random() < ADS_PROB:
+                            await self._send_ad_to_user(user.id, user.first_name)
+                            self.user_last_ad[user.id] = now
+                            return
+                    
                     await message.answer(
                         "🤔 <b>Не понимаю команду</b>\n\n"
-                        "Используйте /help для просмотра доступных команд или кнопки ниже для быстрого доступа.",
+                        "Используйте /help для просмотра доступных команд или кнопки ниже для навигации.",
                         reply_markup=ReplyKeyboardMarkup(
                             keyboard=[
-                                [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="🔄 Статус")]
+                                [KeyboardButton(text="ℹ️ О нас"), KeyboardButton(text="💼 Услуги")],
+                                [KeyboardButton(text="📞 Связаться"), KeyboardButton(text="🎁 Спецпредложение")]
                             ],
                             resize_keyboard=True
                         )
@@ -353,21 +792,6 @@ Username: @{(await self.bot.get_me()).username}
         except:
             return "N/A"
     
-    def _get_start_time(self):
-        """Получение времени запуска"""
-        if self.start_time:
-            return datetime.fromtimestamp(self.start_time).strftime('%Y-%m-%d %H:%M:%S')
-        return "N/A"
-    
-    def _get_system_load(self):
-        """Получение нагрузки системы"""
-        try:
-            import psutil
-            load = psutil.getloadavg()
-            return f"{load[0]:.2f}, {load[1]:.2f}, {load[2]:.2f}"
-        except (ImportError, AttributeError):
-            return "N/A"
-    
     async def _get_ping(self):
         """Получение ping до серверов Telegram"""
         try:
@@ -393,39 +817,78 @@ Username: @{(await self.bot.get_me()).username}
         except:
             return "N/A"
     
-    def _get_total_logs_count(self):
-        """Получение общего количества логов"""
+    def _get_today_users_count(self):
+        """Оценочное количество активных пользователей за сегодня"""
         try:
+            # В реальном приложении здесь должна быть база данных
+            # Сейчас возвращаем примерное число на основе логов
+            today = datetime.now().strftime('%Y-%m-%d')
+            user_ids = set()
             if os.path.exists('bot.log'):
                 with open('bot.log', 'r', encoding='utf-8') as f:
-                    return sum(1 for _ in f)
-            return 0
+                    for line in f:
+                        if today in line and 'от пользователя' in line:
+                            # Пытаемся извлечь ID пользователя из лога
+                            import re
+                            match = re.search(r'от пользователя (\d+)', line)
+                            if match:
+                                user_ids.add(match.group(1))
+            return len(user_ids)
         except:
             return "N/A"
     
-    def _get_log_file_size(self):
-        """Получение размера файла логов"""
+    async def _send_weekly_report(self):
+        """Отправка еженедельного отчета админу"""
         try:
-            if os.path.exists('bot.log'):
-                size = os.path.getsize('bot.log')
-                if size < 1024:
-                    return f"{size} B"
-                elif size < 1024 * 1024:
-                    return f"{size/1024:.2f} KB"
+            if not ADMIN_CHAT_ID:
+                return
+                
+            report_text = f"""
+<b>📊 Еженедельный отчет</b>
+
+<b>Статистика за неделю:</b>
+Активных пользователей: {self._get_today_users_count()}
+Показано рекламы: {len(self.user_last_ad)}
+Логов: {self._get_today_logs_count()}
+
+<b>Система:</b>
+Аптайм: {self._get_uptime()}
+Память: {self._get_memory_usage()} MB
+Объявления в кэше: {len(self.ads_cache)}
+
+<b>Дата отчета:</b> {self._get_current_time()}
+"""
+            await self.bot.send_message(ADMIN_CHAT_ID, report_text)
+            self.logger.info("✅ Еженедельный отчет отправлен админу")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка отправки недельного отчета: {e}")
+    
+    async def _schedule_tasks(self):
+        """Планирование периодических задач"""
+        async def weekly_report_scheduler():
+            while self.is_running:
+                now = datetime.utcnow()
+                
+                # Проверяем, наступило ли время для еженедельного отчета
+                if (now.weekday() == (WEEKLY_REPORT_DOW - 1) % 7 and 
+                    now.hour == WEEKLY_REPORT_HOUR and 
+                    now.minute == 0):
+                    
+                    await self._send_weekly_report()
+                    # Ждем 1 час чтобы не отправить отчет несколько раз в течение часа
+                    await asyncio.sleep(3600)
                 else:
-                    return f"{size/(1024*1024):.2f} MB"
-            return "0 B"
-        except:
-            return "N/A"
-    
-    def _get_estimated_messages(self):
-        """Оценочное количество обработанных сообщений"""
-        try:
-            # Это упрощенная оценка - в реальном боте нужно вести счетчик
-            logs_count = self._get_total_logs_count()
-            return max(0, logs_count // 3)  # Примерная оценка
-        except:
-            return "N/A"
+                    await asyncio.sleep(60)  # Проверяем каждую минуту
+        
+        async def cache_updater():
+            while self.is_running:
+                self._refresh_ads_cache()
+                await asyncio.sleep(GSHEET_REFRESH_MIN * 60)  # Обновляем кэш каждые N минут
+        
+        # Запускаем планировщики
+        asyncio.create_task(weekly_report_scheduler())
+        asyncio.create_task(cache_updater())
     
     async def start(self):
         """Запуск бота"""
@@ -441,19 +904,27 @@ Username: @{(await self.bot.get_me()).username}
             if not await self._create_bot_instance():
                 return False
             
+            # Настраиваем Google Sheets
+            self._setup_google_sheets()
+            
             self._create_dispatcher()
             self._setup_handlers()
             
             self.start_time = asyncio.get_event_loop().time()
             self.is_running = True
             
+            # Обновляем кэш при старте
+            self._refresh_ads_cache()
+            
+            # Запускаем планировщики
+            await self._schedule_tasks()
+            
             self.logger.info("✅ Бот успешно инициализирован, запускаем polling...")
             
-            # Запускаем polling
             await self.dp.start_polling(
                 self.bot,
-                allowed_updates=["message", "callback_query"],
-                handle_signals=False  # Мы сами обрабатываем сигналы
+                allowed_updates=["message", "callback_query", "chat_member"],
+                handle_signals=False
             )
             
             return True
@@ -468,17 +939,14 @@ Username: @{(await self.bot.get_me()).username}
         self.is_running = False
         
         try:
-            # Останавливаем polling
             if self.dp:
                 await self.dp.stop_polling()
                 self.logger.info("✅ Polling остановлен")
             
-            # Закрываем сессию бота
             if self.bot:
                 await self.bot.session.close()
                 self.logger.info("✅ Сессия бота закрыта")
             
-            # Закрываем aiohttp сессию
             await self._close_aiohttp_session()
             
             self.logger.info("✅ Все ресурсы освобождены")
@@ -486,7 +954,6 @@ Username: @{(await self.bot.get_me()).username}
         except Exception as e:
             self.logger.error(f"❌ Ошибка при завершении работы: {e}")
         finally:
-            # Завершаем event loop
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             for task in tasks:
                 task.cancel()
@@ -497,28 +964,27 @@ Username: @{(await self.bot.get_me()).username}
 
 async def main():
     """Основная асинхронная функция"""
-    bot_manager = AdvancedBotManager()
+    bot = TelegramAdsBot()
     
     try:
-        success = await bot_manager.start()
+        success = await bot.start()
         if success:
-            bot_manager.logger.info("🎉 Бот успешно запущен и работает!")
+            bot.logger.info("🎉 Бот успешно запущен и работает!")
         else:
-            bot_manager.logger.error("❌ Не удалось запустить бота")
+            bot.logger.error("❌ Не удалось запустить бота")
             return 1
             
     except KeyboardInterrupt:
-        bot_manager.logger.info("📞 Получен сигнал KeyboardInterrupt")
+        bot.logger.info("📞 Получен сигнал KeyboardInterrupt")
     except Exception as e:
-        bot_manager.logger.error(f"💥 Неожиданная ошибка: {e}")
+        bot.logger.error(f"💥 Неожиданная ошибка: {e}")
         return 1
     finally:
-        await bot_manager._safe_shutdown()
+        await bot._safe_shutdown()
     
     return 0
 
 if __name__ == "__main__":
-    # Запуск асинхронного приложения
     try:
         exit_code = asyncio.run(main())
         sys.exit(exit_code)
