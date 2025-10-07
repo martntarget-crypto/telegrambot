@@ -11,7 +11,7 @@ import time
 import json
 import hashlib
 import sys
-import psutil
+import fcntl
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from time import monotonic
 from datetime import datetime, timedelta
@@ -34,35 +34,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 # ===== КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ ДЛЯ СТАБИЛЬНОСТИ =====
 
-# 1. Остановка всех предыдущих процессов бота
-def kill_previous_instances():
-    """Останавливает все предыдущие процессы этого бота"""
-    current_pid = os.getpid()
-    current_script = os.path.abspath(__file__)
-    
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            # Пропускаем текущий процесс
-            if proc.info['pid'] == current_pid:
-                continue
-                
-            # Ищем процессы Python с этим скриптом
-            cmdline = proc.info['cmdline'] or []
-            if (any('python' in part.lower() for part in cmdline) and
-                any(current_script in part for part in cmdline)):
-                
-                logger.info(f"Останавливаем предыдущий процесс бота: PID {proc.info['pid']}")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except psutil.TimeoutExpired:
-                    proc.kill()
-                    
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-
-# 2. Глобальная блокировка для предотвращения дублирования
-import fcntl
 class SingleInstance:
     """Гарантирует запуск только одного экземпляра бота"""
     def __init__(self, lockfile="/tmp/liveplace_bot.lock"):
@@ -70,19 +41,22 @@ class SingleInstance:
         self.fp = None
         
     def __enter__(self):
-        self.fp = open(self.lockfile, 'w')
         try:
+            self.fp = open(self.lockfile, 'w')
             fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return self
         except IOError:
-            logger.error("Бот уже запущен! Останавливаем этот экземпляр.")
+            logger.error("❌ Бот уже запущен в другом процессе! Останавливаем этот экземпляр.")
+            # Записываем PID текущего процесса в файл для отладки
+            with open("/tmp/liveplace_current_pid.txt", "w") as f:
+                f.write(f"Current PID: {os.getpid()}\n")
             sys.exit(1)
-        return self
         
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.fp:
-            fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
-            self.fp.close()
             try:
+                fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
+                self.fp.close()
                 os.unlink(self.lockfile)
             except:
                 pass
@@ -120,9 +94,6 @@ class RobustBot:
                 await asyncio.sleep(wait_time)
 
 # ===== ИНИЦИАЛИЗАЦИЯ =====
-
-# Останавливаем предыдущие экземпляры ПЕРЕД импортом остальных модулей
-kill_previous_instances()
 
 # Настраиваем логирование
 logging.basicConfig(
@@ -983,14 +954,14 @@ async def on_favs(message: Message):
 async def on_startup():
     try:
         await rows_async(force=True)
-        logger.info("Initial data loaded successfully")
+        logger.info("✅ Initial data loaded successfully")
     except Exception as e:
         logger.warning(f"Preload failed: {e}")
     asyncio.create_task(_auto_refresh_loop())
-    logger.info("Bot started successfully")
+    logger.info("✅ Bot started successfully")
 
 async def on_shutdown():
-    logger.info("Bot shutting down...")
+    logger.info("🛑 Bot shutting down...")
     if robust_bot.session:
         await robust_bot.session.close()
 
@@ -999,9 +970,10 @@ async def main():
     with SingleInstance():  # Гарантия одного экземпляра
         await on_startup()
         try:
+            logger.info("🔄 Starting polling...")
             await dp.start_polling(bot, skip_updates=True)
         except Exception as e:
-            logger.critical(f"Polling failed: {e}")
+            logger.critical(f"❌ Polling failed: {e}")
         finally:
             await on_shutdown()
 
