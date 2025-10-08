@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: telegram-bot-liveplace
+    restart: unless-stopped
+    stop_grace_period: 30s
+    
+    # Переменные окружения
+    env_file:
+      - .env
+    
+    # Health check для мониторинга
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python.*bot.py' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Логи
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Том для логов (опционально)
+    volumes:
+      - ./logs:/app/logs:rw
+
+  # Опционально: сервис для мониторинга логов
+  bot-monitor:
+    image: alpine
+    container_name: bot-logs-monitor
+    command: tail -f /app/logs/bot.log
+    volumes:
+      - ./logs:/app/logs:ro
+    depends_on:
+      - telegram-bot
+    restart: "no"
