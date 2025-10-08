@@ -5,8 +5,4 @@ google-auth-oauthlib==1.1.0
 aiohttp==3.9.1
 python-dotenv==1.0.0
 psutil==5.9.6
-
-# Добавляем совместимые версии
-pydantic>=2.8.2
-pydantic-core>=2.20.0
-
+pydantic>=2.6.0
