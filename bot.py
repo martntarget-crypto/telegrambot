@@ -13,6 +13,8 @@ import time
 import re
 from urllib.parse import urlencode
 import subprocess
+import socket
+import psutil
 
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.types import (
@@ -28,6 +30,25 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
+
+# ===== СИНГЛТОН ПРОВЕРКА =====
+def check_singleton():
+    """Проверка, что бот не запущен в другом процессе"""
+    try:
+        # Создаем socket lock
+        lock_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        lock_socket.bind('\0' + 'telegram_bot_martntarget_lock')
+        print("✅ Singleton check passed - bot can start")
+        return True
+    except socket.error:
+        print("❌ Another instance of bot is already running!")
+        print("💡 If you're sure no other bot is running, try:")
+        print("   - Restarting the server")
+        print("   - Checking running processes: ps aux | grep python")
+        return False
+
+if not check_singleton():
+    sys.exit(1)
 
 # ===== ЗАГРУЗКА КОНФИГУРАЦИИ =====
 load_dotenv()
@@ -382,25 +403,32 @@ class TelegramAdsBot:
     def _kill_old_instances(self):
         """Убиваем старые процессы бота"""
         try:
-            self.logger.info("🔫 Убиваем старые процессы бота...")
+            self.logger.info("🔫 Проверяем старые процессы бота...")
             
-            # Для Linux-based систем
-            if sys.platform in ['linux', 'darwin']:
-                subprocess.run([
-                    'pkill', '-f', 'python.*bot.py'
-                ], capture_output=True, timeout=10)
-                
-            # Для Windows
-            elif sys.platform == 'win32':
-                subprocess.run([
-                    'taskkill', '/F', '/IM', 'python.exe', '/T'
-                ], capture_output=True, timeout=10)
-                
-            time.sleep(2)  # Даем время на завершение процессов
-            self.logger.info("✅ Старые процессы бота завершены")
+            current_pid = os.getpid()
+            killed_count = 0
             
-        except subprocess.TimeoutExpired:
-            self.logger.warning("⚠️ Таймаут при завершении процессов")
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    # Ищем процессы Python с нашим скриптом
+                    if (proc.info['pid'] != current_pid and 
+                        'python' in proc.info['name'].lower() and 
+                        proc.info['cmdline'] and 
+                        any('bot.py' in cmd for cmd in proc.info['cmdline'])):
+                        
+                        self.logger.info(f"🔄 Завершаем процесс {proc.info['pid']}")
+                        proc.terminate()
+                        killed_count += 1
+                        
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+            
+            if killed_count > 0:
+                self.logger.info(f"✅ Завершено {killed_count} старых процессов")
+                time.sleep(2)  # Даем время на завершение
+            else:
+                self.logger.info("✅ Старых процессов не найдено")
+            
         except Exception as e:
             self.logger.error(f"❌ Ошибка при завершении процессов: {e}")
     
@@ -471,6 +499,7 @@ class TelegramAdsBot:
         """Обновление кэша объявлений"""
         try:
             if not self.ads_sheet:
+                self.logger.warning("⚠️ Google Sheets не настроен, пропускаем обновление кэша")
                 return
                 
             # Проверяем, нужно ли обновлять кэш
@@ -478,6 +507,7 @@ class TelegramAdsBot:
                 datetime.now() - self.last_cache_update < timedelta(minutes=GSHEET_REFRESH_MIN)):
                 return
             
+            self.logger.info("🔄 Обновляем кэш данных из Google Sheets...")
             records = self.ads_sheet.get_all_records()
             
             # Временная отладка: выводим первые 2 записи
@@ -485,17 +515,18 @@ class TelegramAdsBot:
                 self.logger.info(f"📊 Первые 2 записи из таблицы: {records[:2]}")
             
             # Разделяем на свойства и рекламные объявления
-            # Используем более гибкую фильтрацию для отладки
             self.properties_cache = []
             self.ads_cache = []
             
             for record in records:
                 # Для свойств: активные объявления
-                if str(record.get('active', '')).strip().lower() in ['1', 'true', 'yes', 'да']:
+                active_status = str(record.get('active', '')).strip().lower()
+                if active_status in ['1', 'true', 'yes', 'да', 'active']:
                     self.properties_cache.append(record)
                 
                 # Для рекламы: активные рекламные объявления  
-                if str(record.get('ad_active', '')).strip().lower() in ['1', 'true', 'yes', 'да']:
+                ad_active_status = str(record.get('ad_active', '')).strip().lower()
+                if ad_active_status in ['1', 'true', 'yes', 'да', 'active']:
                     self.ads_cache.append(record)
             
             self.last_cache_update = datetime.now()
@@ -1251,8 +1282,12 @@ Username: @{user.username or 'N/A'}
         """Планирование периодических задач"""
         async def cache_updater():
             while self.is_running:
-                self._refresh_cache()
-                await asyncio.sleep(GSHEET_REFRESH_MIN * 60)
+                try:
+                    self._refresh_cache()
+                    await asyncio.sleep(GSHEET_REFRESH_MIN * 60)
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка в планировщике кэша: {e}")
+                    await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
         
         # Запускаем планировщик
         asyncio.create_task(cache_updater())
@@ -1321,10 +1356,15 @@ Username: @{user.username or 'N/A'}
         except Exception as e:
             self.logger.error(f"❌ Ошибка при завершении работы: {e}")
         finally:
+            # Отменяем все pending tasks
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                pass
             
             self.logger.info("👋 Бот завершил работу")
 
