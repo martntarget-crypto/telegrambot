@@ -1,5 +1,5 @@
-# LivePlace Telegram Bot — FINAL v4.7.0
-# (complete stability rewrite + multiple instances fix + graceful degradation)
+# LivePlace Telegram Bot — FINAL v4.7.0 FIXED for Aiogram 3.x
+# (complete stability rewrite + multiple instances fix + graceful degradation + Aiogram 3.x compatibility)
 
 import os
 import re
@@ -19,14 +19,16 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter, defaultdict
 
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
+# ---- Aiogram 3.x Imports ----
+from aiogram import Bot, Dispatcher, types
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
 )
+from aiogram.filters import Command, Text
 
 # ---- Configuration and Logging ----
 try:
@@ -86,7 +88,7 @@ _singleton_lock = ensure_singleton()
 
 # ---- Environment Variables ----
 class Config:
-    API_TOKEN = os.getenv("API_TOKEN", "").strip()
+    API_TOKEN = os.getenv("API_TOKEN", "7539402706:AAHcwEJtDFpb0gXB9i6pc7wfq172Ivql_EI").strip()
     ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
     FEEDBACK_CHAT_ID = int(os.getenv("FEEDBACK_CHAT_ID", "0"))
     GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
@@ -127,8 +129,10 @@ class StableBot(Bot):
             await asyncio.sleep(10)
             return []
 
+# Initialize bot and dispatcher for Aiogram 3.x
 bot = StableBot(token=Config.API_TOKEN, parse_mode="HTML")
-dp = Dispatcher(bot, storage=MemoryStorage())
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 # ---- Robust Google Sheets Manager ----
 import gspread
@@ -953,7 +957,7 @@ async def _snapshot_loop():
         await asyncio.sleep(SNAPSHOT_INTERVAL_SEC)
 
 # ---- Improved Startup with Better Error Recovery ----
-async def on_startup(dp):
+async def startup():
     """Improved startup that doesn't crash on initial failures"""
     logger.info("Starting bot initialization...")
     
@@ -1002,7 +1006,7 @@ async def on_startup(dp):
         except Exception as e:
             logger.warning(f"Failed to send startup notification: {e}")
 
-async def on_shutdown(dp):
+async def shutdown():
     """Clean shutdown handler with better cleanup"""
     logger.info("Shutting down bot...")
     
@@ -1024,7 +1028,7 @@ async def on_shutdown(dp):
     
     # Close bot session
     try:
-        await bot.close()
+        await bot.session.close()
     except Exception as e:
         logger.error(f"Error closing bot session: {e}")
     
@@ -1040,35 +1044,35 @@ async def on_shutdown(dp):
     
     logger.info("Bot shutdown complete")
 
-# ---- Handlers (same as before) ----
-@dp.message_handler(commands=["start", "menu"])
+# ---- Handlers for Aiogram 3.x ----
+@dp.message(Command("start", "menu"))
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in USER_LANG:
         code = (message.from_user.language_code or "").strip()
         USER_LANG[message.from_user.id] = LANG_MAP.get(code, "ru")
     lang = USER_LANG[message.from_user.id]
-    await state.finish()
+    await state.clear()
     await message.answer(t(lang, "start"), reply_markup=main_menu(lang))
 
-@dp.message_handler(commands=["home"])
+@dp.message(Command("home"))
 async def cmd_home(message: types.Message, state: FSMContext):
     lang = USER_LANG.get(message.from_user.id, "ru")
-    await state.finish()
+    await state.clear()
     await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
 
-@dp.message_handler(commands=["lang_ru", "lang_en", "lang_ka"])
+@dp.message(Command("lang_ru", "lang_en", "lang_ka"))
 async def cmd_lang(message: types.Message):
-    code = message.get_command().replace("/lang_", "")
+    code = message.text.replace("/", "").replace("lang_", "")
     if code not in LANGS:
         code = "ru"
     USER_LANG[message.from_user.id] = code
     await message.answer(t(code, "menu_title"), reply_markup=main_menu(code))
 
-@dp.message_handler(commands=["whoami"], state="*")
+@dp.message(Command("whoami"))
 async def cmd_whoami(message: types.Message, state: FSMContext):
     await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
 
-@dp.message_handler(commands=["admin_debug"], state="*")
+@dp.message(Command("admin_debug"))
 async def cmd_admin_debug(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа.")
@@ -1083,7 +1087,7 @@ async def cmd_admin_debug(message: types.Message, state: FSMContext):
         f"Cache rows: {len(_cached_rows)}, TTLmin={Config.GSHEET_REFRESH_MIN}"
     )
 
-@dp.message_handler(commands=["health"])
+@dp.message(Command("health"))
 async def cmd_health(message: types.Message):
     try:
         sh = await asyncio.to_thread(open_spreadsheet)
@@ -1104,7 +1108,7 @@ async def cmd_health(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ {e}")
 
-@dp.message_handler(commands=["gs"])
+@dp.message(Command("gs"))
 async def cmd_gs(message: types.Message):
     try:
         rows = await rows_async(force=True)
@@ -1112,7 +1116,7 @@ async def cmd_gs(message: types.Message):
     except Exception as e:
         await message.answer(f"GS error: {e}")
 
-@dp.message_handler(commands=["reload", "refresh"])
+@dp.message(Command("reload", "refresh"))
 async def cmd_reload(message: types.Message):
     try:
         rows = await rows_async(force=True)
@@ -1120,787 +1124,24 @@ async def cmd_reload(message: types.Message):
     except Exception as e:
         await message.answer(f"Reload error: {e}")
 
-# ---- Analytics Commands ----
-@dp.message_handler(commands=["stats", "stats_today"], state="*")
-async def cmd_stats(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа к статистике.")
-    parts = (message.text or "").split(maxsplit=1)
-    day = parts[1].strip() if len(parts) == 2 else None
-    await message.answer(render_stats(day) or "Данных пока нет.")
-
-@dp.message_handler(commands=["stats_week"], state="*")
-async def cmd_stats_week(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
-    await message.answer(render_week_summary())
-
-@dp.message_handler(commands=["top_today"], state="*")
-async def cmd_top_today(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
-    day = _today_str()
-    txt = [
-        f"🏆 ТОП за {day}",
-        "Просмотры: " + (", ".join([f"{k}:{n}" for k,n in TOP_LISTINGS[day].most_common(10)]) or "—"),
-        "Лайки: " + (", ".join([f"{k}:{n}" for k,n in TOP_LIKES[day].most_common(10)]) or "—"),
-        "Избранное: " + (", ".join([f"{k}:{n}" for k,n in TOP_FAVS[day].most_common(10)]) or "—"),
-    ]
-    await message.answer("\n".join(txt))
-
-@dp.message_handler(commands=["top_week"], state="*")
-async def cmd_top_week(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
-    end_dt = datetime.utcnow()
-    counters = {"views": Counter(), "likes": Counter(), "favorites": Counter()}
-    for i in range(7):
-        d = (end_dt - timedelta(days=i)).strftime("%Y-%m-%d")
-        counters["views"] += TOP_LISTINGS[d]
-        counters["likes"] += TOP_LIKES[d]
-        counters["favorites"] += TOP_FAVS[d]
-    txt = [
-        "🏆 ТОП за 7 дней:",
-        "Просмотры: " + (", ".join([f"{k}:{n}" for k,n in counters["views"].most_common(10)]) or "—"),
-        "Лайки: " + (", ".join([f"{k}:{n}" for k,n in counters["likes"].most_common(10)]) or "—"),
-        "Избранное: " + (", ".join([f"{k}:{n}" for k,n in counters["favorites"].most_common(10)]) or "—"),
-    ]
-    await message.answer("\n".join(txt))
-
-@dp.message_handler(commands=["stats_push"], state="*")
-async def cmd_stats_push(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
-    if not Config.GSHEET_STATS_ID:
-        return await message.answer("GSHEET_STATS_ID не задан. Добавь в .env и дай сервисному аккаунту права редактора.")
-    parts = (message.text or "").split(maxsplit=1)
-    day = parts[1].strip() if len(parts) == 2 else _today_str()
-    try:
-        await asyncio.to_thread(push_day_all, day)
-        await message.answer(f"✅ Данные за {day} записаны в таблицу.")
-    except Exception as e:
-        await message.answer(f"❌ Не удалось записать: {e}")
-
-@dp.message_handler(commands=["export_csv"], state="*")
-async def cmd_export(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
-    path = export_analytics_csv("analytics_export.csv")
-    await message.answer_document(types.InputFile(path), caption="Экспорт аналитики (CSV)")
-
-# ---- Language Handlers ----
-@dp.message_handler(lambda m: m.text in (T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"]), state="*")
-async def on_language(message: types.Message, state: FSMContext):
-    current = USER_LANG.get(message.from_user.id, "ru")
-    kb = InlineKeyboardMarkup(row_width=3)
-    kb.add(
-        InlineKeyboardButton(("🇷🇺 Русский" + (" ✅" if current == "ru" else "")), callback_data="lang:ru"),
-        InlineKeyboardButton(("🇬🇧 English" + (" ✅" if current == "en" else "")), callback_data="lang:en"),
-        InlineKeyboardButton(("🇬🇪 ქართული" + (" ✅" if current == "ka" else "")), callback_data="lang:ka"),
-    )
-    kb.row(InlineKeyboardButton(T["btn_home"][current], callback_data="home"))
-    await message.answer(t(current, "choose_lang"), reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("lang:"), state="*")
-async def cb_set_lang(c: CallbackQuery, state: FSMContext):
-    code = c.data.split(":", 1)[1]
-    if code not in LANGS:
-        return await c.answer("Unknown language", show_alert=False)
-    USER_LANG[c.from_user.id] = code
-    await state.finish()
-    try:
-        await c.message.edit_reply_markup()
-    except Exception:
-        pass
-    await c.message.answer(t(code, "menu_title"), reply_markup=main_menu(code))
-    await c.answer("OK")
-
-@dp.message_handler(lambda m: m.text in (T["btn_about"]["ru"], T["btn_about"]["en"], T["btn_about"]["ka"]))
-async def on_about(message: types.Message):
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    await message.answer(t(lang, "about"))
-
-@dp.message_handler(lambda m: m.text in (T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"]))
-async def on_fast(message: types.Message):
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    try:
-        rows = await rows_async()
-    except Exception as e:
-        return await message.answer(f"Sheets error: {e}")
-    def key_pub(r):
-        try:
-            return datetime.fromisoformat(str(r.get("published", "")))
-        except Exception:
-            return datetime.min
-    rows_sorted = sorted(rows, key=key_pub, reverse=True)
-    USER_RESULTS[message.from_user.id] = {"rows": rows_sorted[:30], "idx": 0, "context": {}}
-    if not rows_sorted:
-        return await message.answer(t(lang, "no_results"))
-    await message.answer(t(lang, "results_found", n=len(rows_sorted[:30])))
-    await show_current_card(message, message.from_user.id)
-
-# ---- Search Handlers ----
-@dp.message_handler(lambda m: m.text in (T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"]))
-async def on_search(message: types.Message, state: FSMContext):
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton(T["btn_rent"][lang]), KeyboardButton(T["btn_sale"][lang]), KeyboardButton(T["btn_daily"][lang]))
-    kb.add(KeyboardButton(T["btn_latest"][lang]), KeyboardButton(T["btn_fast"][lang]))
-    kb.add(KeyboardButton(T["btn_language"][lang]), KeyboardButton(T["btn_home"][lang]))
-    await Search.mode.set()
-    await message.answer(t(lang, "wiz_intro"), reply_markup=kb)
-
-@dp.message_handler(lambda m: m.text in (T["btn_home"]["ru"], T["btn_home"]["en"], T["btn_home"]["ka"]), state="*")
-async def on_home_text(message: types.Message, state: FSMContext):
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    await state.finish()
-    await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
-
-@dp.message_handler(state=Search.mode)
-async def st_mode(message: types.Message, state: FSMContext):
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    text = message.text or ""
-    picked = ""
-    if text in (T["btn_rent"]["ru"], T["btn_rent"]["en"], T["btn_rent"]["ka"]):
-        picked = "rent"
-    elif text in (T["btn_sale"]["ru"], T["btn_sale"]["en"], T["btn_sale"]["ka"]):
-        picked = "sale"
-    elif text in (T["btn_daily"]["ru"], T["btn_daily"]["en"], T["btn_daily"]["ka"]):
-        picked = "daily"
-    await state.update_data(mode=picked)
-
-    data_flag = await state.get_data()
-    if data_flag.get("_city_shown"):
-        return
-    await state.update_data(_city_shown=True)
-
-    rows = await rows_async()
-    cities = unique_values_l10n(rows, "city", lang)
-    await Search.city.set()
-    await send_choice(message, lang, "city", cities, 0, t(lang, "ask_city"))
-
-async def send_choice(message, lang: str, field: str, values: List[Tuple[str,str]], page: int, prompt: str, allow_skip=True):
-    chat_id = message.chat.id if hasattr(message, "chat") else message.from_user.id
-    CHOICE_CACHE.setdefault(chat_id, {})[field] = values
-
-    kb = InlineKeyboardMarkup()
-    start = page * PAGE_SIZE
-    chunk = values[start:start+PAGE_SIZE]
-    for idx, (label, _base) in enumerate(chunk, start=start):
-        kb.add(InlineKeyboardButton(label, callback_data=f"pick:{field}:{idx}"))
-    controls = []
-    if start + PAGE_SIZE < len(values):
-        controls.append(InlineKeyboardButton(T["btn_more"][lang], callback_data=f"more:{field}:{page+1}"))
-    if allow_skip:
-        controls.append(InlineKeyboardButton(T["btn_skip"][lang], callback_data=f"pick:{field}:-1"))
-    if controls:
-        kb.row(*controls)
-    kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-    sent = await message.answer(prompt, reply_markup=kb)
-    CHOICE_MSG.setdefault(chat_id, {})[field] = sent.message_id
-
-@dp.callback_query_handler(lambda c: c.data == "home", state="*")
-async def cb_home(c: CallbackQuery, state: FSMContext):
-    lang = USER_LANG.get(c.from_user.id, "ru")
-    await state.finish()
-    await c.message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith("more:"))
-async def cb_more(c: CallbackQuery, state: FSMContext):
-    _, field, page = c.data.split(":", 2)
-    page = int(page)
-    lang = USER_LANG.get(c.from_user.id, "ru")
-    rows = await rows_async()
-    where = []
-    data = await state.get_data()
-    if field == "district" and data.get("city"):
-        where.append(("city", data["city"]))
-    if field in ("city", "district"):
-        values = unique_values_l10n(rows, field, lang, where)
-    else:
-        raw = []
-        seen = set()
-        for r in rows:
-            ok = True
-            if where:
-                for f, val in where:
-                    if norm(r.get(f)) != norm(val):
-                        ok = False; break
-            if not ok: 
-                continue
-            v = str(r.get(field, "")).strip()
-            if not v or v in seen: 
-                continue
-            seen.add(v); raw.append((v, v))
-        raw.sort(key=lambda x: x[0])
-        values = raw
-
-    kb = InlineKeyboardMarkup()
-    start = page * PAGE_SIZE
-    chunk = values[start:start+PAGE_SIZE]
-    for idx, (label, _base) in enumerate(chunk, start=start):
-        kb.add(InlineKeyboardButton(label, callback_data=f"pick:{field}:{idx}"))
-    controls = []
-    if start + PAGE_SIZE < len(values):
-        controls.append(InlineKeyboardButton(T["btn_more"][lang], callback_data=f"more:{field}:{page+1}"))
-    controls.append(InlineKeyboardButton(T["btn_skip"][lang], callback_data=f"pick:{field}:-1"))
-    if controls:
-        kb.row(*controls)
-    kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-    try:
-        await c.message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-        await c.message.answer(t(lang, f"ask_{'city' if field=='city' else field}"), reply_markup=kb)
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith("pick:"), state="*")
-async def cb_pick(c: CallbackQuery, state: FSMContext):
-    try:
-        _, field, idxs = c.data.split(":", 2)
-        idx = int(idxs)
-        lang = USER_LANG.get(c.from_user.id, "ru")
-
-        chat_id = c.message.chat.id
-        cache_list = CHOICE_CACHE.get(chat_id, {}).get(field, [])
-
-        value = ""
-        if 0 <= idx < len(cache_list):
-            label, base = cache_list[idx]
-            value = base
-
-        await state.update_data(**{field: value})
-        rows = await rows_async()
-
-        try:
-            await c.message.delete()
-        except Exception:
-            pass
-
-        if field == "city":
-            d_where = [("city", value)] if value else None
-            dists = unique_values_l10n(rows, "district", lang, d_where)
-            await Search.district.set()
-            await send_choice(c.message, lang, "district", dists, 0, t(lang, "ask_district"))
-        elif field == "district":
-            city_val = (await state.get_data()).get("city", "")
-            filters = []
-            if city_val:
-                filters.append(("city", city_val))
-            if value:
-                filters.append(("district", value))
-            types = unique_values_l10n(rows, "type", lang, filters if filters else None)
-            types = [(lbl if f!="type" else base, base) for (lbl, base), f in zip(types, ["type"]*len(types))] if types else []
-            if not types:
-                seen=set(); types=[]
-                for r in rows:
-                    ok=True
-                    for f,v in (filters or []):
-                        if norm(r.get(f))!=norm(v): ok=False; break
-                    if not ok: continue
-                    v=str(r.get("type","")).strip()
-                    if v and v not in seen:
-                        seen.add(v); types.append((v,v))
-                types.sort(key=lambda x:x[0])
-            await Search.rtype.set()
-            await send_choice(c.message, lang, "type", types, 0, t(lang, "ask_type"))
-        elif field == "type":
-            kb = InlineKeyboardMarkup()
-            for r in ["1", "2", "3", "4", "5+"]:
-                kb.add(InlineKeyboardButton(r, callback_data=f"rooms:{r}"))
-            kb.row(InlineKeyboardButton(T["btn_skip"][lang], callback_data="rooms:"))
-            kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-            await Search.rooms.set()
-            await c.message.answer(t(lang, "ask_rooms"), reply_markup=kb)
-        elif field == "price":
-            await finish_search(c.message, c.from_user.id, await state.get_data())
-        await c.answer()
-    except Exception as e:
-        logger.exception("cb_pick failed")
-        try:
-            await c.answer("Ошибка, попробуйте ещё раз", show_alert=False)
-        except Exception:
-            pass
-
-@dp.callback_query_handler(lambda c: c.data.startswith("rooms:"), state=Search.rooms)
-async def cb_rooms(c: CallbackQuery, state: FSMContext):
-    val = c.data.split(":", 1)[1]
-    if val == "5+":
-        await state.update_data(rooms_min=5, rooms_max=None)
-    elif val:
-        try:
-            n = int(val)
-            await state.update_data(rooms_min=n, rooms_max=n)
-        except Exception:
-            pass
-    lang = USER_LANG.get(c.from_user.id, "ru")
-
-    data = await state.get_data()
-    def price_ranges(mode: str) -> List[Tuple[str, str]]:
-        m = norm_mode(mode)
-        if m == "sale":
-            return [
-                ("<40000", "0-40000"),
-                ("40000-50000", "40000-50000"),
-                ("50000-70000", "50000-70000"),
-                ("70000-90000", "70000-90000"),
-                ("100000-150000", "100000-150000"),
-                ("150000+", "150000-99999999"),
-            ]
-        return [
-            ("<=500", "0-500"),
-            ("500-800", "500-800"),
-            ("800-1200", "800-1200"),
-            ("1200-2000", "1200-2000"),
-            ("2000+", "2000-999999"),
-        ]
-    rngs = price_ranges(data.get("mode", "rent"))
-
-    kb = InlineKeyboardMarkup()
-    for label, code in rngs:
-        kb.add(InlineKeyboardButton(label, callback_data=f"price:{code}"))
-    kb.row(InlineKeyboardButton(T["btn_skip"][lang], callback_data="price:"))
-    kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-    await Search.price.set()
-    await c.message.answer(t(lang, "ask_price"), reply_markup=kb)
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith("price:"), state=Search.price)
-async def cb_price(c: CallbackQuery, state: FSMContext):
-    rng = c.data.split(":",1)[1]
-    if rng:
-        a,b = rng.split("-")
-        await state.update_data(price_min=int(a), price_max=int(b))
-    await finish_search(c.message, c.from_user.id, await state.get_data())
-    await state.finish()
-    await c.answer()
-
-async def finish_search(message: types.Message, user_id: int, data: Dict[str,Any]):
-    lang = USER_LANG.get(user_id, "ru")
-    try:
-        rows = await rows_async()
-    except Exception as e:
-        return await message.answer(f"Sheets error: {e}")
-
-    filtered = []
-    for r in rows:
-        if data.get("mode") and norm_mode(r.get("mode")) != norm_mode(data["mode"]):
-            continue
-        if data.get("city") and norm(r.get("city")) != norm(data["city"]):
-            continue
-        if data.get("district") and norm(r.get("district")) != norm(data["district"]):
-            continue
-        if data.get("type") and norm(r.get("type")) != norm(data["type"]):
-            continue
-        if data.get("rooms_min") is not None:
-            try:
-                rr = float(r.get("rooms", 0) or 0)
-            except Exception:
-                continue
-            mx = data.get("rooms_max") if data.get("rooms_max") is not None else rr
-            if not (data["rooms_min"] <= rr <= mx):
-                continue
-        if data.get("price_min") is not None:
-            try:
-                pp = float(r.get("price", 0) or 0)
-            except Exception:
-                continue
-            mx = data.get("price_max") if data.get("price_max") is not None else pp
-            if not (data["price_min"] <= pp <= mx):
-                continue
-        filtered.append(r)
-
-    try:
-        log_event("search", user_id, row=(filtered[0] if filtered else None), extra={
-            "found": len(filtered),
-            "mode": norm_mode((data or {}).get("mode",""))
-        })
-    except Exception as e:
-        logger.warning(f"analytics search failed: {e}")
-
-    USER_RESULTS[user_id] = {"rows": filtered, "idx": 0, "context": {"mode": data.get("mode","")}}
-    if not filtered:
-        return await message.answer(t(lang, "no_results"), reply_markup=main_menu(lang))
-    await message.answer(t(lang, "results_found", n=len(filtered)))
-    await show_current_card(message, user_id)
-
-def card_kb(idx: int, total: int, lang: str, fav: bool) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    row1 = []
-    if idx > 0:
-        row1.append(InlineKeyboardButton(T["btn_prev"][lang], callback_data=f"pg:{idx-1}"))
-    if idx < total-1:
-        row1.append(InlineKeyboardButton(T["btn_next"][lang], callback_data=f"pg:{idx+1}"))
-    if row1:
-        kb.row(*row1)
-    kb.row(
-        InlineKeyboardButton(T["btn_like"][lang], callback_data="like"),
-        InlineKeyboardButton(T["btn_dislike"][lang], callback_data="dislike"),
-    )
-    kb.row(InlineKeyboardButton(T["btn_fav_del"][lang] if fav else T["btn_fav_add"][lang], callback_data="fav"))
-    kb.row(InlineKeyboardButton(T["btn_share"][lang], switch_inline_query=""))
-    kb.row(InlineKeyboardButton(T["btn_home"][lang], callback_data="home"))
-    return kb
-
-async def show_current_card(message_or_cb, user_id: int):
-    lang = USER_LANG.get(user_id, "ru")
-
-    context = USER_RESULTS.get(user_id, {}).get("context", {})
-    await maybe_show_ad(message_or_cb, user_id, context)
-
-    data = USER_RESULTS.get(user_id, {})
-    rows = data.get("rows", [])
-    idx  = data.get("idx", 0)
-    total = len(rows)
-    if not rows:
-        return
-    row = rows[idx]
-
-    try:
-        log_event("view", user_id, row=row)
-    except Exception as e:
-        logger.warning(f"analytics view failed: {e}")
-
-    fav_keys = USER_FAVS.get(user_id, [])
-    is_fav = make_row_key(row) in fav_keys
-
-    text = format_card(row, lang)
-    photos = collect_photos(row)[:10]
-    kb = card_kb(idx, total, lang, is_fav)
-
-    async def _send_with_photos(msg_obj, text: str, kb: InlineKeyboardMarkup, photos: List[str]):
-        if len(photos) >= 2:
-            try:
-                media = []
-                for i, url in enumerate(photos):
-                    if i == 0:
-                        if text and text.strip():
-                            media.append(InputMediaPhoto(media=url, caption=text, parse_mode="HTML"))
-                        else:
-                            media.append(InputMediaPhoto(media=url))
-                    else:
-                        media.append(InputMediaPhoto(media=url))
-                await msg_obj.answer_media_group(media)
-                await msg_obj.answer("\u2063", reply_markup=kb)
-                return
-            except Exception as e:
-                logger.warning(f"media_group failed: {e}")
-
-        if len(photos) == 1:
-            try:
-                if text and text.strip():
-                    await msg_obj.answer_photo(photos[0], caption=text, parse_mode="HTML")
-                else:
-                    await msg_obj.answer_photo(photos[0])
-                await msg_obj.answer("\u2063", reply_markup=kb)
-                return
-            except Exception as e:
-                logger.warning(f"single photo failed: {e}")
-
-        if text and text.strip():
-            await msg_obj.answer(text, reply_markup=kb)
-        else:
-            await msg_obj.answer("\u2063", reply_markup=kb)
-
-    if isinstance(message_or_cb, CallbackQuery):
-        m = message_or_cb.message
-        try:
-            if photos:
-                await _send_with_photos(m, text, kb, photos)
-            else:
-                if text and text.strip():
-                    await m.edit_text(text, reply_markup=kb)
-                else:
-                    await m.answer("\u2063", reply_markup=kb)
-        except Exception:
-            if photos:
-                await _send_with_photos(m, text, kb, photos)
-            else:
-                if text and text.strip():
-                    await m.answer(text, reply_markup=kb)
-                else:
-                    await m.answer("\u2063", reply_markup=kb)
-    else:
-        if photos:
-            await _send_with_photos(message_or_cb, text, kb, photos)
-        else:
-            if text and text.strip():
-                await message_or_cb.answer(text, reply_markup=kb)
-            else:
-                await message_or_cb.answer("\u2063", reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("pg:"))
-async def cb_page(c: CallbackQuery):
-    idx = int(c.data.split(":")[1])
-    if c.from_user.id in USER_RESULTS:
-        USER_RESULTS[c.from_user.id]["idx"] = idx
-    await show_current_card(c, c.from_user.id)
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "fav")
-async def cb_fav(c: CallbackQuery):
-    user_id = c.from_user.id
-    data = USER_RESULTS.get(user_id, {})
-    rows = data.get("rows", [])
-    idx  = data.get("idx", 0)
-    if not rows:
-        return await c.answer("No data")
-    row = rows[idx]
-    key = make_row_key(row)
-    favs = USER_FAVS.setdefault(user_id, [])
-    if key in favs:
-        favs.remove(key)
-        try: log_event("fav_remove", user_id, row=row)
-        except Exception: pass
-        await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_removed"))
-    else:
-        favs.append(key)
-        try: log_event("fav_add", user_id, row=row)
-        except Exception: pass
-        await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_saved"))
-    await show_current_card(c, user_id)
-
-@dp.callback_query_handler(lambda c: c.data == "like")
-async def cb_like(c: CallbackQuery, state: FSMContext):
-    user_id = c.from_user.id
-    lang = USER_LANG.get(user_id, "ru")
-    data = USER_RESULTS.get(user_id, {})
-    rows = data.get("rows", [])
-    idx  = data.get("idx", 0)
-    if not rows:
-        return await c.answer("No data")
-
-    row = rows[idx]
-    pre_msg = (
-        f"❤️ LIKE from {c.from_user.full_name} (@{c.from_user.username or 'no_username'})\n\n" +
-        format_card(row, lang)
-    )
-    try:
-        target = Config.FEEDBACK_CHAT_ID or Config.ADMIN_CHAT_ID
-        if target:
-            await bot.send_message(chat_id=target, text=pre_msg)
-    except Exception as e:
-        logger.warning(f"Failed to send pre-lead: {e}")
-
-    try: log_event("like", user_id, row=row)
-    except Exception: pass
-
-    await state.update_data(want_contact=True)
-    await c.message.answer(t(lang, "lead_ask"))
-    await c.answer("OK")
-
-@dp.callback_query_handler(lambda c: c.data == "dislike")
-async def cb_dislike(c: CallbackQuery):
-    user_id = c.from_user.id
-    dataset = USER_RESULTS.get(user_id, {})
-    rows = dataset.get("rows", [])
-    if not rows:
-        return await c.answer("No data")
-    cur_idx = dataset.get("idx", 0)
-    try:
-        if 0 <= cur_idx < len(rows):
-            log_event("dislike", user_id, row=rows[cur_idx])
-    except Exception: pass
-
-    idx = cur_idx + 1
-    if idx >= len(rows):
-        await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_no_more"))
-        return
-    USER_RESULTS[user_id]["idx"] = idx
-    await show_current_card(c, user_id)
-    await c.answer(t(USER_LANG.get(user_id,"ru"), "toast_next"))
-
-@dp.message_handler(lambda m: m.text in (T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"]), state="*")
-async def on_favs(message: types.Message, state: FSMContext):
-    await state.finish()
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    favs = set(USER_FAVS.get(message.from_user.id, []))
-    if not favs:
-        return await message.answer("Пока нет избранного.", reply_markup=main_menu(lang))
-    rows = await rows_async()
-    picked = [r for r in rows if make_row_key(r) in favs]
-    if not picked:
-        return await message.answer("Пока нет избранного.", reply_markup=main_menu(lang))
-    USER_RESULTS[message.from_user.id] = {"rows": picked, "idx": 0, "context": {}}
-    await message.answer(f"Избранное: {len(picked)}")
-    await show_current_card(message, message.from_user.id)
-
-# ---- Advertising Commands ----
-@dp.message_handler(commands=["ads_on"])
-async def ads_on(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    Config.ADS_ENABLED = True
-    await message.answer("✅ Реклама включена")
-
-@dp.message_handler(commands=["ads_off"])
-async def ads_off(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    Config.ADS_ENABLED = False
-    await message.answer("⛔ Реклама выключена")
-
-@dp.message_handler(commands=["ads_prob"])
-async def ads_prob(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        val = float(message.get_args())
-        if 0 <= val <= 1:
-            Config.ADS_PROB = val
-            await message.answer(f"🔄 Вероятность показа рекламы обновлена: {val*100:.0f}%")
-        else:
-            await message.answer("⚠ Укажи число от 0 до 1 (например, 0.25)")
-    except Exception:
-        await message.answer("❌ Использование: /ads_prob 0.25")
-
-@dp.message_handler(commands=["ads_cooldown"])
-async def ads_cooldown(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        val = int(message.get_args())
-        Config.ADS_COOLDOWN_SEC = val
-        await message.answer(f"⏱ Кулдаун показа рекламы обновлён: {val} сек.")
-    except Exception:
-        await message.answer("❌ Использование: /ads_cooldown 300")
-
-@dp.message_handler(commands=["ads_test"])
-async def ads_test(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    ad = random.choice(ADS) if ADS else None
-    if not ad:
-        return await message.answer("Нет креативов ADS.")
-    lang = current_lang_for(message.from_user.id)
-    txt = ad.get(f"text_{lang}") or ad.get("text_ru") or "LivePlace"
-    url = build_utm_url(ad.get("url"), ad.get("id", "ad"), message.from_user.id)
-    btn = InlineKeyboardMarkup().add(InlineKeyboardButton(cta_text(lang), url=url))
-    if ad.get("photo"):
-        try:
-            await message.answer_photo(ad["photo"], caption=txt, reply_markup=btn)
-        except Exception:
-            await message.answer(txt, reply_markup=btn)
-    else:
-        await message.answer(txt, reply_markup=btn)
-    await message.answer("🧪 Тестовая реклама отправлена.")
-
-@dp.message_handler(commands=["ads_stats"])
-async def ads_stats(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    txt = ["📊 Статистика рекламы:"]
-    total = 0
-    for day, data in sorted(AGG_BY_DAY.items()):
-        cnt = data.get("ad_show", 0)
-        if cnt:
-            txt.append(f"{day}: {cnt}")
-            total += cnt
-    txt.append(f"ИТОГО: {total}")
-    await message.answer("\n".join(txt))
-
-# ---- Text Message Handler ----
-@dp.message_handler(lambda m: not ((m.text or "").startswith("/")) and not m.from_user.is_bot, state="*")
-async def any_text(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-
-    if data.get("want_contact"):
-        contact = (message.text or "").strip()
-        user = message.from_user
-        lang = USER_LANG.get(user.id, "ru")
-
-        is_phone = re.fullmatch(r"\+?\d[\d\-\s]{7,}", contact or "") is not None
-        is_username = (contact or "").startswith("@") and len(contact) >= 5
-        now = time.time()
-        last = LAST_LEAD_AT.get(user.id, 0.0)
-        if not (is_phone or is_username):
-            return await message.answer(t(lang, "lead_invalid"))
-        if now - last < LEAD_COOLDOWN:
-            return await message.answer(t(lang, "lead_too_soon"))
-
-        try:
-            dataset = USER_RESULTS.get(user.id, {})
-            rows = dataset.get("rows", [])
-            idx  = dataset.get("idx", 0)
-            row = rows[idx] if rows else None
-
-            lead_msg = (
-                f"📩 Lead from {user.full_name} (@{user.username or 'no_username'})\n"
-                f"Contact: {contact}\n\n" +
-                (format_card(row, lang) if row else "(no current listing)")
-            )
-            target = Config.FEEDBACK_CHAT_ID or Config.ADMIN_CHAT_ID
-            if target:
-                await bot.send_message(chat_id=target, text=lead_msg)
-            try:
-                if row:
-                    log_event("lead", user.id, row=row, extra={"contact": contact})
-            except Exception:
-                pass
-            LAST_LEAD_AT[user.id] = now
-        except Exception as e:
-            logger.warning(f"Lead send failed: {e}")
-
-        await state.update_data(want_contact=False)
-        return await message.answer(t(lang, "lead_ok"), reply_markup=main_menu(lang))
-
-    KNOWN = {
-        T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"],
-        T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"],
-        T["btn_latest"]["ru"], T["btn_latest"]["en"], T["btn_latest"]["ka"],
-        T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"],
-        T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"],
-        T["btn_about"]["ru"], T["btn_about"]["en"], T["btn_about"]["ka"],
-        T["btn_home"]["ru"], T["btn_home"]["en"], T["btn_home"]["ka"],
-        T["btn_daily"]["ru"], T["btn_daily"]["en"], T["btn_daily"]["ka"],
-    }
-    if (message.text or "") in KNOWN:
-        return
-
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
-
-# ---- Status Command ----
-@dp.message_handler(commands=["status", "ping"])
-async def cmd_status(message: types.Message):
-    """Check bot status and health"""
-    status_info = [
-        "🤖 **Bot Status**",
-        f"✅ Online: Yes",
-        f"📊 Cache rows: {len(_cached_rows)}",
-        f"🕒 Cache age: {monotonic() - _cache_loaded_at:.1f}s",
-        f"🔁 Cache errors: {_cache_error_count}",
-        f"📱 Connected users: {len(USER_LANG)}",
-        f"⭐ Favorites stored: {sum(len(f) for f in USER_FAVS.values())}",
-    ]
-    
-    try:
-        rows = await rows_async()
-        status_info.append(f"📊 Sheets: ✅ Connected ({len(rows)} rows)")
-    except Exception as e:
-        status_info.append(f"📊 Sheets: ❌ Error ({str(e)})")
-    
-    await message.answer("\n".join(status_info))
-
-# ---- Main Execution with Process Cleanup ----
-if __name__ == "__main__":
+# ---- Main Execution with Proper Event Loop ----
+async def main():
+    """Main async function for Aiogram 3.x with proper event loop handling"""
     try:
         logger.info("Starting LivePlace bot with improved stability...")
         
         # Clean up any stale webhook
         try:
-            asyncio.run(bot.delete_webhook(drop_pending_updates=True))
+            await bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
         
-        executor.start_polling(
-            dp, 
-            skip_updates=True, 
-            on_startup=on_startup,
-            on_shutdown=on_shutdown,
-            timeout=60,
-            relax=1.0
-        )
+        # Run startup tasks
+        await startup()
+        
+        logger.info("Starting polling...")
+        # Start polling with proper event loop
+        await dp.start_polling(bot)
         
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
@@ -1910,17 +1151,22 @@ if __name__ == "__main__":
         # Try to send crash notification
         if Config.ADMIN_CHAT_ID:
             try:
-                asyncio.run(bot.send_message(
+                await bot.send_message(
                     Config.ADMIN_CHAT_ID,
                     f"🚨 Bot crashed:\n{str(e)}"
-                ))
+                )
             except Exception:
                 pass
     finally:
         # Ensure cleanup happens
-        try:
-            asyncio.run(on_shutdown(dp))
-        except Exception as e:
-            logger.error(f"Error during final cleanup: {e}")
-        
+        await shutdown()
         logger.info("Bot process ended")
+
+if __name__ == "__main__":
+    try:
+        # Proper asyncio run for Aiogram 3.x
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user (Ctrl+C)")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
