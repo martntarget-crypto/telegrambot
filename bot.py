@@ -1883,11 +1883,24 @@ async def cmd_status(message: types.Message):
     await message.answer("\n".join(status_info))
 
 # ---- Main Execution with Process Cleanup ----
-# ---- Main Execution with Process Cleanup ----
 async def main():
     """Main async function for Aiogram 3.x"""
     try:
         logger.info("Starting LivePlace bot with improved stability...")
+        
+        # Load initial data and analytics BEFORE starting bot
+        try:
+            await rows_async(force=True)
+            logger.info("Initial data loaded successfully")
+        except Exception as e:
+            logger.error(f"Initial data load failed: {e}")
+            logger.info("Bot will start with empty cache and retry in background")
+        
+        # Load analytics snapshot
+        try:
+            load_analytics_snapshot()
+        except Exception as e:
+            logger.warning(f"Failed to load analytics snapshot: {e}")
         
         # Clean up any stale webhook
         try:
@@ -1895,8 +1908,36 @@ async def main():
         except Exception:
             pass
         
-        # Run startup tasks
-        await on_startup(dp)
+        # Start background tasks
+        tasks = [
+            ("auto_refresh", _auto_refresh_loop()),
+            ("midnight_flush", _midnight_flush_loop()),
+            ("weekly_report", _weekly_report_loop()),
+            ("snapshot", _snapshot_loop())
+        ]
+        
+        for task_name, task_coro in tasks:
+            try:
+                await create_background_task(task_coro, task_name)
+                logger.info(f"Started background task: {task_name}")
+            except Exception as e:
+                logger.error(f"Failed to start background task {task_name}: {e}")
+        
+        logger.info(f"Bot started successfully. Admin IDs: {sorted(ADMINS_SET)}")
+        logger.info(f"Cache status: {len(_cached_rows)} rows loaded")
+        
+        # Send startup notification to admin
+        if Config.ADMIN_CHAT_ID:
+            try:
+                cache_status = f"{len(_cached_rows)} rows" if _cached_rows else "EMPTY"
+                await bot.send_message(
+                    Config.ADMIN_CHAT_ID,
+                    f"🤖 Bot started successfully\n"
+                    f"📊 Cache: {cache_status}\n"
+                    f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send startup notification: {e}")
         
         # Start polling
         await dp.start_polling(bot)
@@ -1927,5 +1968,3 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-
-
