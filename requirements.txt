@@ -3,3 +3,4 @@ python-dotenv
 gspread
 google-auth
 pandas
+psutil==5.9.6
