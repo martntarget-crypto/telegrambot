@@ -1883,24 +1883,23 @@ async def cmd_status(message: types.Message):
     await message.answer("\n".join(status_info))
 
 # ---- Main Execution with Process Cleanup ----
-if __name__ == "__main__":
+# ---- Main Execution with Process Cleanup ----
+async def main():
+    """Main async function for Aiogram 3.x"""
     try:
         logger.info("Starting LivePlace bot with improved stability...")
         
         # Clean up any stale webhook
         try:
-            asyncio.run(bot.delete_webhook(drop_pending_updates=True))
+            await bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
         
-        executor.start_polling(
-            dp, 
-            skip_updates=True, 
-            on_startup=on_startup,
-            on_shutdown=on_shutdown,
-            timeout=60,
-            relax=1.0
-        )
+        # Run startup tasks
+        await on_startup(dp)
+        
+        # Start polling
+        await dp.start_polling(bot)
         
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
@@ -1910,17 +1909,22 @@ if __name__ == "__main__":
         # Try to send crash notification
         if Config.ADMIN_CHAT_ID:
             try:
-                asyncio.run(bot.send_message(
+                await bot.send_message(
                     Config.ADMIN_CHAT_ID,
                     f"🚨 Bot crashed:\n{str(e)}"
-                ))
+                )
             except Exception:
                 pass
     finally:
         # Ensure cleanup happens
-        try:
-            asyncio.run(on_shutdown(dp))
-        except Exception as e:
-            logger.error(f"Error during final cleanup: {e}")
-        
+        await on_shutdown(dp)
         logger.info("Bot process ended")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user (Ctrl+C)")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+
