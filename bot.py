@@ -1,5 +1,5 @@
-# LivePlace Telegram Bot — FINAL v4.6.0
-# (complete rewrite with stability improvements)
+# LivePlace Telegram Bot — FINAL v4.7.0
+# (complete stability rewrite + multiple instances fix + graceful degradation)
 
 import os
 import re
@@ -12,6 +12,7 @@ import json
 import hashlib
 import fcntl
 import sys
+import psutil
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from time import monotonic
 from datetime import datetime, timedelta
@@ -40,13 +41,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger("liveplace")
 
-# ---- Singleton Protection ----
+# ---- Enhanced Singleton Protection ----
 def ensure_singleton():
-    """Prevent multiple instances from running simultaneously"""
+    """Prevent multiple instances from running simultaneously with PID checking"""
     lock_file_path = "/tmp/liveplace_bot.lock"
+    
     try:
+        # Check if lock file exists and if process is still running
+        if os.path.exists(lock_file_path):
+            try:
+                with open(lock_file_path, 'r') as f:
+                    old_pid = int(f.read().strip())
+                
+                # Check if process with that PID is still running
+                if psutil.pid_exists(old_pid):
+                    try:
+                        process = psutil.Process(old_pid)
+                        cmdline = " ".join(process.cmdline()).lower()
+                        if "python" in cmdline and "liveplace" in cmdline:
+                            logger.error(f"Another bot instance is running with PID {old_pid}")
+                            sys.exit(1)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        # Process doesn't exist or we can't access it, remove stale lock
+                        os.remove(lock_file_path)
+            except (ValueError, IOError):
+                # Lock file is corrupted, remove it
+                os.remove(lock_file_path)
+        
+        # Create new lock file
         lock_file = open(lock_file_path, 'w')
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
         fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info("Singleton lock acquired successfully")
         return lock_file
     except IOError:
         logger.error("Another instance of the bot is already running!")
@@ -97,13 +124,13 @@ class StableBot(Bot):
             return await super().get_updates(*args, **kwargs)
         except Exception as e:
             logger.error(f"Get updates error: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
             return []
 
 bot = StableBot(token=Config.API_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot, storage=MemoryStorage())
 
-# ---- Improved Google Sheets Manager ----
+# ---- Robust Google Sheets Manager ----
 import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.exceptions import RefreshError
@@ -112,10 +139,20 @@ class SheetsManager:
     def __init__(self):
         self._gc = None
         self._last_auth_time = 0
-        self._auth_retry_delay = 60
+        self._auth_retry_delay = 300
+        self._auth_error_count = 0
+        self._max_auth_errors = 3
         
     def _reauthenticate_if_needed(self):
         now = time.time()
+        
+        # Don't retry too frequently on auth errors
+        if self._auth_error_count >= self._max_auth_errors:
+            if now - self._last_auth_time < 3600:
+                raise RuntimeError("Too many authentication errors. Waiting before retry.")
+            else:
+                self._auth_error_count = 0
+        
         if self._gc is None or (now - self._last_auth_time) > 3500:
             try:
                 CREDS_FILE = "credentials.json"
@@ -125,10 +162,20 @@ class SheetsManager:
                 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
                 creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
                 self._gc = gspread.authorize(creds)
+                
                 self._last_auth_time = now
-                logger.info("Google Sheets reauthenticated successfully")
+                self._auth_error_count = 0
+                logger.info("Google Sheets authenticated successfully")
+                
+            except RefreshError as e:
+                self._auth_error_count += 1
+                logger.error(f"Google Sheets token refresh error: {e}")
+                self._gc = None
+                raise RuntimeError("Google Sheets authentication expired") from e
             except Exception as e:
+                self._auth_error_count += 1
                 logger.error(f"Google Sheets authentication failed: {e}")
+                self._gc = None
                 raise
     
     def get_client(self):
@@ -141,43 +188,33 @@ def open_spreadsheet():
     try:
         gc = sheets_manager.get_client()
         return gc.open_by_key(Config.GSHEET_ID)
-    except RefreshError as e:
-        logger.error(f"Google Sheets token refresh error: {e}")
-        sheets_manager._gc = None
-        raise RuntimeError("Google Sheets authentication expired") from e
-    except gspread.SpreadsheetNotFound as e:
-        raise RuntimeError("Spreadsheet not found. Check GSHEET_ID and sharing.") from e
     except Exception as e:
-        logger.error(f"Unexpected Google Sheets error: {e}")
-        raise
+        logger.error(f"Failed to open spreadsheet: {e}")
+        raise RuntimeError(f"Cannot access spreadsheet: {e}") from e
 
 def get_worksheet():
-    sh = open_spreadsheet()
     try:
+        sh = open_spreadsheet()
         return sh.worksheet(Config.GSHEET_TAB)
     except gspread.WorksheetNotFound as e:
         tabs = [w.title for w in sh.worksheets()]
         raise RuntimeError(f"Worksheet '{Config.GSHEET_TAB}' not found. Available: {tabs}") from e
+    except Exception as e:
+        logger.error(f"Failed to get worksheet: {e}")
+        raise
 
-# ---- Data Management ----
+# ---- Data Management with Graceful Degradation ----
 REQUIRED_COLUMNS = {
     "mode","city","district","type","rooms","price","published",
     "title_ru","title_en","title_ka","description_ru","description_en","description_ka",
     "phone","photo1","photo2","photo3","photo4","photo5","photo6","photo7","photo8","photo9","photo10"
 }
 
-OPTIONAL_L10N = {"city_en","city_ka","district_en","district_ka"}
-
-def check_schema(ws) -> None:
-    header = [h.strip() for h in ws.row_values(1)]
-    missing = sorted(list(REQUIRED_COLUMNS - set(header)))
-    if missing:
-        raise RuntimeError(f"Missing columns: {missing}\nHeader: {header}")
-
 _cached_rows: List[Dict[str, Any]] = []
 _cache_loaded_at: float = 0.0
 _cache_error_count: int = 0
-_MAX_CACHE_ERRORS = 5
+_MAX_CACHE_ERRORS = 3
+_LAST_SUCCESSFUL_LOAD: float = 0.0
 
 def _is_cache_stale() -> bool:
     if not _cached_rows:
@@ -186,31 +223,50 @@ def _is_cache_stale() -> bool:
     return (monotonic() - _cache_loaded_at) >= ttl
 
 def load_rows(force: bool = False) -> List[Dict[str, Any]]:
-    global _cached_rows, _cache_loaded_at, _cache_error_count
+    global _cached_rows, _cache_loaded_at, _cache_error_count, _LAST_SUCCESSFUL_LOAD
     
     if _cached_rows and not force and not _is_cache_stale():
         return _cached_rows
         
     if _cache_error_count >= _MAX_CACHE_ERRORS:
-        logger.warning("Too many cache errors, using stale data")
-        return _cached_rows or []
+        time_since_last_success = monotonic() - _LAST_SUCCESSFUL_LOAD
+        if time_since_last_success < 3600:
+            logger.warning(f"Using stale data ({len(_cached_rows)} rows) due to repeated errors")
+            return _cached_rows or []
+        else:
+            logger.error("Too many cache errors and data is too old")
+            return []
     
     try:
         ws = get_worksheet()
-        check_schema(ws)
+        
+        # Basic schema check without failing
+        try:
+            header = [h.strip() for h in ws.row_values(1)]
+            missing = sorted(list(REQUIRED_COLUMNS - set(header)))
+            if missing:
+                logger.warning(f"Missing columns in sheet: {missing}")
+        except Exception as schema_error:
+            logger.warning(f"Schema check failed: {schema_error}")
+        
         rows = ws.get_all_records()
         _cached_rows = rows
         _cache_loaded_at = monotonic()
+        _LAST_SUCCESSFUL_LOAD = _cache_loaded_at
         _cache_error_count = 0
         logger.info(f"Successfully loaded {len(rows)} rows from Google Sheets")
         return rows
+        
     except Exception as e:
         _cache_error_count += 1
         logger.error(f"Failed to load rows (attempt {_cache_error_count}/{_MAX_CACHE_ERRORS}): {e}")
+        
         if _cached_rows:
             logger.warning("Using cached data due to loading error")
             return _cached_rows
-        raise
+        else:
+            logger.error("No cached data available")
+            return []
 
 async def rows_async(force: bool = False) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(load_rows, force)
@@ -547,7 +603,7 @@ TOP_LIKES = defaultdict(lambda: Counter())
 TOP_FAVS = defaultdict(lambda: Counter())
 
 ANALYTICS_SNAPSHOT = "analytics_snapshot.json"
-SNAPSHOT_INTERVAL_SEC = 120
+SNAPSHOT_INTERVAL_SEC = 300
 
 def make_row_key(r: Dict[str,Any]) -> str:
     payload = "|".join([
@@ -664,19 +720,23 @@ def export_analytics_csv(path: str = "analytics_export.csv"):
 
 # ---- Analytics Persistence ----
 def save_analytics_snapshot():
-    data = {
-      "ANALYTIC_EVENTS": ANALYTIC_EVENTS,
-      "AGG_BY_DAY": {k: dict(v) for k,v in AGG_BY_DAY.items()},
-      "AGG_BY_MODE": {k: dict(v) for k,v in AGG_BY_MODE.items()},
-      "AGG_CITY": {k: dict(v) for k,v in AGG_CITY.items()},
-      "AGG_DISTRICT": {k: dict(v) for k,v in AGG_DISTRICT.items()},
-      "AGG_FUNNEL": {k: dict(v) for k,v in AGG_FUNNEL.items()},
-      "TOP_LISTINGS": {k: dict(v) for k,v in TOP_LISTINGS.items()},
-      "TOP_LIKES": {k: dict(v) for k,v in TOP_LIKES.items()},
-      "TOP_FAVS": {k: dict(v) for k,v in TOP_FAVS.items()},
-    }
-    with open(ANALYTICS_SNAPSHOT, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    try:
+        data = {
+          "ANALYTIC_EVENTS": ANALYTIC_EVENTS,
+          "AGG_BY_DAY": {k: dict(v) for k,v in AGG_BY_DAY.items()},
+          "AGG_BY_MODE": {k: dict(v) for k,v in AGG_BY_MODE.items()},
+          "AGG_CITY": {k: dict(v) for k,v in AGG_CITY.items()},
+          "AGG_DISTRICT": {k: dict(v) for k,v in AGG_DISTRICT.items()},
+          "AGG_FUNNEL": {k: dict(v) for k,v in AGG_FUNNEL.items()},
+          "TOP_LISTINGS": {k: dict(v) for k,v in TOP_LISTINGS.items()},
+          "TOP_LIKES": {k: dict(v) for k,v in TOP_LIKES.items()},
+          "TOP_FAVS": {k: dict(v) for k,v in TOP_FAVS.items()},
+        }
+        with open(ANALYTICS_SNAPSHOT, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        logger.debug("Analytics snapshot saved")
+    except Exception as e:
+        logger.error(f"Failed to save analytics snapshot: {e}")
 
 def load_analytics_snapshot():
     if not os.path.exists(ANALYTICS_SNAPSHOT):
@@ -731,40 +791,48 @@ DAILY_HEADER = [
 TOP_HEADER = ["day","metric","rank","key","count"]
 
 def push_daily_to_sheet(day: str):
-    sh = _open_stats_book()
-    ws = _ensure_sheet(sh, "Daily", DAILY_HEADER)
+    try:
+        sh = _open_stats_book()
+        ws = _ensure_sheet(sh, "Daily", DAILY_HEADER)
 
-    mode = AGG_BY_MODE[day]
-    total = AGG_BY_DAY[day]
-    row = [
-        day,
-        total["view"], total["like"], total["dislike"], total["lead"], total["fav_add"], total["fav_remove"],
-        mode["rent_view"], mode["rent_like"], mode["rent_lead"],
-        mode["daily_view"], mode["daily_like"], mode["daily_lead"],
-        mode["sale_view"], mode["sale_like"], mode["sale_lead"],
-    ]
+        mode = AGG_BY_MODE[day]
+        total = AGG_BY_DAY[day]
+        row = [
+            day,
+            total["view"], total["like"], total["dislike"], total["lead"], total["fav_add"], total["fav_remove"],
+            mode["rent_view"], mode["rent_like"], mode["rent_lead"],
+            mode["daily_view"], mode["daily_like"], mode["daily_lead"],
+            mode["sale_view"], mode["sale_like"], mode["sale_lead"],
+        ]
 
-    existing = ws.col_values(1)
-    if day in existing:
-        idx = existing.index(day) + 1
-        ws.update(f"A{idx}:P{idx}", [row])
-    else:
-        ws.append_row(row)
+        existing = ws.col_values(1)
+        if day in existing:
+            idx = existing.index(day) + 1
+            ws.update(f"A{idx}:P{idx}", [row])
+        else:
+            ws.append_row(row)
+    except Exception as e:
+        logger.error(f"Failed to push daily stats: {e}")
+        raise
 
 def push_top_to_sheet(day: str, top_n: int = 20):
-    sh = _open_stats_book()
-    ws = _ensure_sheet(sh, "Top", TOP_HEADER)
+    try:
+        sh = _open_stats_book()
+        ws = _ensure_sheet(sh, "Top", TOP_HEADER)
 
-    def write_block(metric: str, counter: Counter):
-        rows = []
-        for i, (key, cnt) in enumerate(counter.most_common(top_n), start=1):
-            rows.append([day, metric, i, key, cnt])
-        if rows:
-            ws.append_rows(rows)
+        def write_block(metric: str, counter: Counter):
+            rows = []
+            for i, (key, cnt) in enumerate(counter.most_common(top_n), start=1):
+                rows.append([day, metric, i, key, cnt])
+            if rows:
+                ws.append_rows(rows)
 
-    write_block("views", TOP_LISTINGS[day])
-    write_block("likes", TOP_LIKES[day])
-    write_block("favorites", TOP_FAVS[day])
+        write_block("views", TOP_LISTINGS[day])
+        write_block("likes", TOP_LIKES[day])
+        write_block("favorites", TOP_FAVS[day])
+    except Exception as e:
+        logger.error(f"Failed to push top stats: {e}")
+        raise
 
 def push_day_all(day: str):
     push_daily_to_sheet(day)
@@ -777,35 +845,46 @@ async def create_background_task(coro, task_name: str):
     """Safely create and track background tasks"""
     task = asyncio.create_task(coro, name=task_name)
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    
+    def remove_task(fut):
+        _background_tasks.discard(task)
+        if fut.exception():
+            logger.error(f"Background task {task_name} failed: {fut.exception()}")
+    
+    task.add_done_callback(remove_task)
     return task
 
 async def _auto_refresh_loop():
-    """Improved auto-refresh with exponential backoff"""
+    """Improved auto-refresh with graceful degradation"""
     error_count = 0
-    base_delay = 30
-    max_delay = 300
+    base_delay = 60
+    max_delay = 1800
     
     while True:
         try:
             if _is_cache_stale():
                 await rows_async(force=True)
                 error_count = 0
+                base_delay = 60
                 logger.debug("Sheets cache refreshed successfully")
+            else:
+                await asyncio.sleep(base_delay)
+                continue
                 
-            delay = base_delay
-            await asyncio.sleep(delay)
-            
         except Exception as e:
             error_count += 1
-            delay = min(base_delay * (2 ** min(error_count, 5)), max_delay)
+            delay = min(base_delay * (2 ** min(error_count, 6)), max_delay)
             delay *= random.uniform(0.8, 1.2)
             
-            logger.error(f"Auto refresh failed (attempt {error_count}), retrying in {delay:.1f}s: {e}")
+            if error_count <= 3:
+                logger.error(f"Auto refresh failed (attempt {error_count}), retrying in {delay:.1f}s: {e}")
+            else:
+                logger.warning(f"Auto refresh still failing (attempt {error_count}), retrying in {delay:.1f}s")
+            
             await asyncio.sleep(delay)
 
 async def _midnight_flush_loop():
-    """Improved midnight flush with error handling"""
+    """Improved midnight flush that doesn't crash on errors"""
     already_processed = set()
     
     while True:
@@ -815,15 +894,13 @@ async def _midnight_flush_loop():
                 day = (now - timedelta(days=1)).strftime("%Y-%m-%d")
                 mark = f"{day}-flush"
                 
-                if mark not in already_processed:
-                    if Config.GSHEET_STATS_ID:
-                        try:
-                            await asyncio.to_thread(push_day_all, day)
-                            already_processed.add(mark)
-                            logger.info(f"Successfully pushed analytics for {day}")
-                        except Exception as e:
-                            logger.error(f"Failed to push analytics for {day}: {e}")
-                    else:
+                if mark not in already_processed and Config.GSHEET_STATS_ID:
+                    try:
+                        await asyncio.to_thread(push_day_all, day)
+                        already_processed.add(mark)
+                        logger.info(f"Successfully pushed analytics for {day}")
+                    except Exception as e:
+                        logger.error(f"Failed to push analytics for {day}: {e}")
                         already_processed.add(mark)
             
             cutoff = (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%d")
@@ -832,10 +909,10 @@ async def _midnight_flush_loop():
         except Exception as e:
             logger.error(f"Midnight flush loop error: {e}")
         
-        await asyncio.sleep(60)
+        await asyncio.sleep(300)
 
 async def _weekly_report_loop():
-    """Improved weekly report with error handling"""
+    """Improved weekly report that handles errors gracefully"""
     sent_reports = set()
     
     while True:
@@ -864,10 +941,10 @@ async def _weekly_report_loop():
         except Exception as e:
             logger.error(f"Weekly report loop error: {e}")
         
-        await asyncio.sleep(300)
+        await asyncio.sleep(600)
 
 async def _snapshot_loop():
-    """Improved snapshot loop with error handling"""
+    """Improved snapshot loop that doesn't crash on errors"""
     while True:
         try:
             save_analytics_snapshot()
@@ -875,17 +952,26 @@ async def _snapshot_loop():
             logger.error(f"Snapshot save failed: {e}")
         await asyncio.sleep(SNAPSHOT_INTERVAL_SEC)
 
-# ---- Startup and Shutdown ----
+# ---- Improved Startup with Better Error Recovery ----
 async def on_startup(dp):
-    """Improved startup with proper task management"""
+    """Improved startup that doesn't crash on initial failures"""
+    logger.info("Starting bot initialization...")
+    
+    # Try to load data but don't crash if it fails
     try:
         await rows_async(force=True)
         logger.info("Initial data loaded successfully")
     except Exception as e:
         logger.error(f"Initial data load failed: {e}")
+        logger.info("Bot will start with empty cache and retry in background")
     
-    load_analytics_snapshot()
+    # Load analytics snapshot
+    try:
+        load_analytics_snapshot()
+    except Exception as e:
+        logger.warning(f"Failed to load analytics snapshot: {e}")
     
+    # Start background tasks with error handling
     tasks = [
         ("auto_refresh", _auto_refresh_loop()),
         ("midnight_flush", _midnight_flush_loop()),
@@ -901,28 +987,60 @@ async def on_startup(dp):
             logger.error(f"Failed to start background task {task_name}: {e}")
     
     logger.info(f"Bot started successfully. Admin IDs: {sorted(ADMINS_SET)}")
+    logger.info(f"Cache status: {len(_cached_rows)} rows loaded")
+    
+    # Send startup notification to admin
+    if Config.ADMIN_CHAT_ID:
+        try:
+            cache_status = f"{len(_cached_rows)} rows" if _cached_rows else "EMPTY"
+            await bot.send_message(
+                Config.ADMIN_CHAT_ID,
+                f"🤖 Bot started successfully\n"
+                f"📊 Cache: {cache_status}\n"
+                f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send startup notification: {e}")
 
 async def on_shutdown(dp):
-    """Clean shutdown handler"""
+    """Clean shutdown handler with better cleanup"""
     logger.info("Shutting down bot...")
     
+    # Cancel all background tasks
     for task in _background_tasks:
         task.cancel()
     
     if _background_tasks:
-        await asyncio.wait(_background_tasks, timeout=5.0)
+        try:
+            await asyncio.wait(_background_tasks, timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("Some background tasks didn't finish in time")
     
-    await bot.close()
+    # Save analytics before shutdown
+    try:
+        save_analytics_snapshot()
+    except Exception as e:
+        logger.error(f"Failed to save analytics on shutdown: {e}")
     
+    # Close bot session
+    try:
+        await bot.close()
+    except Exception as e:
+        logger.error(f"Error closing bot session: {e}")
+    
+    # Release singleton lock
     if _singleton_lock:
         try:
+            lock_file_path = "/tmp/liveplace_bot.lock"
+            if os.path.exists(lock_file_path):
+                os.remove(lock_file_path)
             _singleton_lock.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error removing lock file: {e}")
     
     logger.info("Bot shutdown complete")
 
-# ---- Handlers ----
+# ---- Handlers (same as before) ----
 @dp.message_handler(commands=["start", "menu"])
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in USER_LANG:
@@ -1742,34 +1860,67 @@ async def any_text(message: types.Message, state: FSMContext):
     lang = USER_LANG.get(message.from_user.id, "ru")
     await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
 
-# ---- Main Execution ----
+# ---- Status Command ----
+@dp.message_handler(commands=["status", "ping"])
+async def cmd_status(message: types.Message):
+    """Check bot status and health"""
+    status_info = [
+        "🤖 **Bot Status**",
+        f"✅ Online: Yes",
+        f"📊 Cache rows: {len(_cached_rows)}",
+        f"🕒 Cache age: {monotonic() - _cache_loaded_at:.1f}s",
+        f"🔁 Cache errors: {_cache_error_count}",
+        f"📱 Connected users: {len(USER_LANG)}",
+        f"⭐ Favorites stored: {sum(len(f) for f in USER_FAVS.values())}",
+    ]
+    
+    try:
+        rows = await rows_async()
+        status_info.append(f"📊 Sheets: ✅ Connected ({len(rows)} rows)")
+    except Exception as e:
+        status_info.append(f"📊 Sheets: ❌ Error ({str(e)})")
+    
+    await message.answer("\n".join(status_info))
+
+# ---- Main Execution with Process Cleanup ----
 if __name__ == "__main__":
     try:
-        logger.info("Starting LivePlace bot with stability improvements...")
+        logger.info("Starting LivePlace bot with improved stability...")
+        
+        # Clean up any stale webhook
+        try:
+            asyncio.run(bot.delete_webhook(drop_pending_updates=True))
+        except Exception:
+            pass
         
         executor.start_polling(
             dp, 
             skip_updates=True, 
             on_startup=on_startup,
             on_shutdown=on_shutdown,
-            timeout=30,
-            relax=0.1
+            timeout=60,
+            relax=1.0
         )
         
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
-    finally:
-        try:
-            asyncio.run(on_shutdown(dp))
-        except Exception:
-            pass
         
-        if _singleton_lock:
+        # Try to send crash notification
+        if Config.ADMIN_CHAT_ID:
             try:
-                _singleton_lock.close()
+                asyncio.run(bot.send_message(
+                    Config.ADMIN_CHAT_ID,
+                    f"🚨 Bot crashed:\n{str(e)}"
+                ))
             except Exception:
                 pass
+    finally:
+        # Ensure cleanup happens
+        try:
+            asyncio.run(on_shutdown(dp))
+        except Exception as e:
+            logger.error(f"Error during final cleanup: {e}")
         
         logger.info("Bot process ended")
