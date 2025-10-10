@@ -19,8 +19,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter, defaultdict
 
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram import Bot, Dispatcher, types
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import (
@@ -1927,4 +1927,5 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
 
