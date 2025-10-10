@@ -1,29 +1,5 @@
-# LivePlace Telegram Bot — FINAL v4.5.0
-# (analytics + ads + reliability + media fix + i18n keyboard refresh + city/district localization)
-#
-# Новое:
-# - Полная локализация пунктов выбора городов и районов (кнопки соответствуют языку интерфейса)
-# - Поддержка дополнительных колонок в Google Sheets:
-#     city_en, city_ka, district_en, district_ka
-#   (если их нет или пустые — будет использовано значение из базовых city/district)
-# - Фильтрация объявлений по-прежнему выполняется по базовым полям city/district
-# - Безопасная отправка media_group (фикс "Text must be non-empty")
-# - Всё из версий 4.4.x сохранено (аналитика, реклама, отчёты, кеш таблицы, автообновления)
-#
-# Требуется в .env (пример):
-# API_TOKEN=...
-# ADMIN_CHAT_ID=123
-# FEEDBACK_CHAT_ID=456
-# GSHEET_ID=...         # таблица с объявлениями
-# GSHEET_TAB=Ads
-# GSHEET_REFRESH_MIN=2
-# GSHEET_STATS_ID=...   # (опционально) книга для статистики
-#
-# В таблице должны быть колонки (минимум):
-# mode,city,district,type,rooms,price,published,title_ru,title_en,title_ka,description_ru,description_en,description_ka,phone,photo1..photo10
-# Рекомендуемые для локализации списков выбора:
-# city_en, city_ka, district_en, district_ka
-# Если их нет — будет использоваться city/district как есть.
+# LivePlace Telegram Bot — FINAL v4.6.0
+# (complete rewrite with stability improvements)
 
 import os
 import re
@@ -34,12 +10,13 @@ import random
 import time
 import json
 import hashlib
+import fcntl
+import sys
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from time import monotonic
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter, defaultdict
-
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -50,81 +27,145 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
 )
 
-# ---- .env
+# ---- Configuration and Logging ----
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("liveplace")
 
-# ---- ENV
-API_TOKEN           = os.getenv("API_TOKEN", "").strip()
-ADMIN_CHAT_ID       = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
-FEEDBACK_CHAT_ID    = int(os.getenv("FEEDBACK_CHAT_ID", "0"))
-GSHEET_ID           = os.getenv("GSHEET_ID", "").strip()
-GSHEET_TAB          = os.getenv("GSHEET_TAB", "Ads").strip()
-GSHEET_REFRESH_MIN  = int(os.getenv("GSHEET_REFRESH_MIN", "2"))
+# ---- Singleton Protection ----
+def ensure_singleton():
+    """Prevent multiple instances from running simultaneously"""
+    lock_file_path = "/tmp/liveplace_bot.lock"
+    try:
+        lock_file = open(lock_file_path, 'w')
+        fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_file
+    except IOError:
+        logger.error("Another instance of the bot is already running!")
+        sys.exit(1)
+    except Exception as e:
+        logger.warning(f"Could not create lock file: {e}")
+        return None
 
-UTM_SOURCE          = os.getenv("UTM_SOURCE", "telegram")
-UTM_MEDIUM          = os.getenv("UTM_MEDIUM", "bot")
-UTM_CAMPAIGN        = os.getenv("UTM_CAMPAIGN", "bot_ads")
+_singleton_lock = ensure_singleton()
 
-GSHEET_STATS_ID     = os.getenv("GSHEET_STATS_ID", "").strip()
-WEEKLY_REPORT_DOW   = int(os.getenv("WEEKLY_REPORT_DOW", "1") or "1")  # 1=Mon..7=Sun
-WEEKLY_REPORT_HOUR  = int(os.getenv("WEEKLY_REPORT_HOUR", "9") or "9") # UTC
+# ---- Environment Variables ----
+class Config:
+    API_TOKEN = os.getenv("API_TOKEN", "").strip()
+    ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
+    FEEDBACK_CHAT_ID = int(os.getenv("FEEDBACK_CHAT_ID", "0"))
+    GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
+    GSHEET_TAB = os.getenv("GSHEET_TAB", "Ads").strip()
+    GSHEET_REFRESH_MIN = int(os.getenv("GSHEET_REFRESH_MIN", "2"))
+    
+    UTM_SOURCE = os.getenv("UTM_SOURCE", "telegram")
+    UTM_MEDIUM = os.getenv("UTM_MEDIUM", "bot")
+    UTM_CAMPAIGN = os.getenv("UTM_CAMPAIGN", "bot_ads")
+    
+    GSHEET_STATS_ID = os.getenv("GSHEET_STATS_ID", "").strip()
+    WEEKLY_REPORT_DOW = int(os.getenv("WEEKLY_REPORT_DOW", "1") or "1")
+    WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "9") or "9")
+    
+    ADS_ENABLED = os.getenv("ADS_ENABLED", "1").strip() not in {"0", "false", "False", ""}
+    ADS_PROB = float(os.getenv("ADS_PROB", "0.18"))
+    ADS_COOLDOWN_SEC = int(os.getenv("ADS_COOLDOWN_SEC", "180"))
 
-if not API_TOKEN:
+if not Config.API_TOKEN:
     raise RuntimeError("API_TOKEN is not set")
 
-# --- Admins
+# ---- Admin Management ----
 ADMINS_RAW = os.getenv("ADMINS", "").strip()
 ADMINS_SET = set(int(x) for x in ADMINS_RAW.split(",") if x.strip().isdigit())
-if ADMIN_CHAT_ID:
-    ADMINS_SET.add(ADMIN_CHAT_ID)
+if Config.ADMIN_CHAT_ID:
+    ADMINS_SET.add(Config.ADMIN_CHAT_ID)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS_SET
 
-# ---- Bot
-bot = Bot(token=API_TOKEN, parse_mode="HTML")
-dp  = Dispatcher(bot, storage=MemoryStorage())
+# ---- Stable Bot Implementation ----
+class StableBot(Bot):
+    async def get_updates(self, *args, **kwargs):
+        try:
+            return await super().get_updates(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Get updates error: {e}")
+            await asyncio.sleep(5)
+            return []
 
-# ---- Google Sheets
+bot = StableBot(token=Config.API_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+# ---- Improved Google Sheets Manager ----
 import gspread
 from google.oauth2.service_account import Credentials
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # read/write (нужно для выгрузки статистики)
-CREDS_FILE = "credentials.json"
-if not os.path.exists(CREDS_FILE):
-    raise RuntimeError("credentials.json is missing next to bot.py")
-creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
-gc    = gspread.authorize(creds)
+from google.auth.exceptions import RefreshError
 
-# ---------- Google Sheets helpers (sync) ----------
+class SheetsManager:
+    def __init__(self):
+        self._gc = None
+        self._last_auth_time = 0
+        self._auth_retry_delay = 60
+        
+    def _reauthenticate_if_needed(self):
+        now = time.time()
+        if self._gc is None or (now - self._last_auth_time) > 3500:
+            try:
+                CREDS_FILE = "credentials.json"
+                if not os.path.exists(CREDS_FILE):
+                    raise RuntimeError(f"credentials.json not found at {CREDS_FILE}")
+                
+                SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+                creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+                self._gc = gspread.authorize(creds)
+                self._last_auth_time = now
+                logger.info("Google Sheets reauthenticated successfully")
+            except Exception as e:
+                logger.error(f"Google Sheets authentication failed: {e}")
+                raise
+    
+    def get_client(self):
+        self._reauthenticate_if_needed()
+        return self._gc
+
+sheets_manager = SheetsManager()
+
 def open_spreadsheet():
     try:
-        return gc.open_by_key(GSHEET_ID)
+        gc = sheets_manager.get_client()
+        return gc.open_by_key(Config.GSHEET_ID)
+    except RefreshError as e:
+        logger.error(f"Google Sheets token refresh error: {e}")
+        sheets_manager._gc = None
+        raise RuntimeError("Google Sheets authentication expired") from e
     except gspread.SpreadsheetNotFound as e:
         raise RuntimeError("Spreadsheet not found. Check GSHEET_ID and sharing.") from e
+    except Exception as e:
+        logger.error(f"Unexpected Google Sheets error: {e}")
+        raise
 
 def get_worksheet():
     sh = open_spreadsheet()
     try:
-        return sh.worksheet(GSHEET_TAB)
+        return sh.worksheet(Config.GSHEET_TAB)
     except gspread.WorksheetNotFound as e:
         tabs = [w.title for w in sh.worksheets()]
-        raise RuntimeError(f"Worksheet '{GSHEET_TAB}' not found. Available: {tabs}") from e
+        raise RuntimeError(f"Worksheet '{Config.GSHEET_TAB}' not found. Available: {tabs}") from e
 
+# ---- Data Management ----
 REQUIRED_COLUMNS = {
     "mode","city","district","type","rooms","price","published",
-    "title_ru","title_en","title_ka",
-    "description_ru","description_en","description_ka",
-    "phone",
-    "photo1","photo2","photo3","photo4","photo5","photo6","photo7","photo8","photo9","photo10"
+    "title_ru","title_en","title_ka","description_ru","description_en","description_ka",
+    "phone","photo1","photo2","photo3","photo4","photo5","photo6","photo7","photo8","photo9","photo10"
 }
-# Рекомендуемые (не обязательные)
+
 OPTIONAL_L10N = {"city_en","city_ka","district_en","district_ka"}
 
 def check_schema(ws) -> None:
@@ -135,29 +176,46 @@ def check_schema(ws) -> None:
 
 _cached_rows: List[Dict[str, Any]] = []
 _cache_loaded_at: float = 0.0
+_cache_error_count: int = 0
+_MAX_CACHE_ERRORS = 5
 
 def _is_cache_stale() -> bool:
     if not _cached_rows:
         return True
-    ttl = max(1, GSHEET_REFRESH_MIN) * 60
+    ttl = max(1, Config.GSHEET_REFRESH_MIN) * 60
     return (monotonic() - _cache_loaded_at) >= ttl
 
 def load_rows(force: bool = False) -> List[Dict[str, Any]]:
-    global _cached_rows, _cache_loaded_at
+    global _cached_rows, _cache_loaded_at, _cache_error_count
+    
     if _cached_rows and not force and not _is_cache_stale():
         return _cached_rows
-    ws = get_worksheet()
-    check_schema(ws)
-    rows = ws.get_all_records()
-    _cached_rows = rows
-    _cache_loaded_at = monotonic()
-    return rows
+        
+    if _cache_error_count >= _MAX_CACHE_ERRORS:
+        logger.warning("Too many cache errors, using stale data")
+        return _cached_rows or []
+    
+    try:
+        ws = get_worksheet()
+        check_schema(ws)
+        rows = ws.get_all_records()
+        _cached_rows = rows
+        _cache_loaded_at = monotonic()
+        _cache_error_count = 0
+        logger.info(f"Successfully loaded {len(rows)} rows from Google Sheets")
+        return rows
+    except Exception as e:
+        _cache_error_count += 1
+        logger.error(f"Failed to load rows (attempt {_cache_error_count}/{_MAX_CACHE_ERRORS}): {e}")
+        if _cached_rows:
+            logger.warning("Using cached data due to loading error")
+            return _cached_rows
+        raise
 
-# Async wrappers for Sheets I/O
-async def rows_async(force: bool=False) -> List[Dict[str, Any]]:
+async def rows_async(force: bool = False) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(load_rows, force)
 
-# ====== i18n ======
+# ---- Internationalization ----
 LANGS = ["ru", "en", "ka"]
 USER_LANG: Dict[int, str] = {}
 LANG_MAP = {"ru":"ru","ru-RU":"ru","en":"en","en-US":"en","en-GB":"en","ka":"ka","ka-GE":"ka"}
@@ -172,56 +230,10 @@ T = {
     "btn_favs": {"ru": "❤️ Избранное", "en": "❤️ Favorites", "ka": "❤️ რჩეულები"},
     "btn_home": {"ru": "🏠 Меню", "en": "🏠 Menu", "ka": "🏠 მენიუ"},
     "btn_daily": {"ru": "🕓 Посуточно 🆕", "en": "🕓 Daily rent 🆕", "ka": "🕓 დღიურად 🆕"},
-
-    "start": {
-        "ru": (
-            "<b>LivePlace</b>\n👋 Привет! Я помогу подобрать <b>идеальную недвижимость в Грузии</b>.\n\n"
-            "<b>Как это работает?</b>\n"
-            "— Задам 3–4 простых вопроса\n"
-            "— Покажу лучшие варианты с фото и телефоном владельца\n"
-            "— Просто посмотреть? Жми <b>🟢 Быстрый подбор</b>\n\n"
-            "Добро пожаловать и удачного поиска! 🏡"
-        ),
-        "en": (
-            "<b>LivePlace</b>\n👋 Hi! I'll help you find <b>your ideal home in Georgia</b>.\n\n"
-            "<b>How it works:</b>\n"
-            "— I ask 3–4 quick questions\n"
-            "— Show top options with photos and owner phone\n"
-            "— Just browsing? Tap <b>🟢 Quick picks</b>\n\n"
-            "Welcome and happy hunting! 🏡"
-        ),
-        "ka": (
-            "<b>LivePlace</b>\n👋 გამარჯობა! ერთად ვიპოვოთ <b>იდეალური ბინა საქართველოში</b>.\n\n"
-            "<b>როგორ მუშაობს:</b>\n"
-            "— 3–4 მარტივი კითხვა\n"
-            "— საუკეთესო ვარიანტები ფოტოებითა და მფლობელის ნომრით\n"
-            "— უბრალოდ გადაათვალიერე? დააჭირე <b>🟢 სწრაფი არჩევანი</b>\n\n"
-            "კეთილი იყოს თქვენი მობრძანება! 🏡"
-        ),
-    },
-    "about": {
-        "ru": "LivePlace: быстрый подбор недвижимости в Грузии. Фильтры, 10 фото, телефон владельца, избранное.",
-        "en": "LivePlace: fast real-estate search in Georgia. Filters, 10 photos, owner phone, favorites.",
-        "ka": "LivePlace: უძრავი ქონების სწრაფი ძიება საქართველოში. ფილტრები, 10 ფოტო, მფლობელის ნომერი, რჩეულები."
-    },
-    "choose_lang": {"ru": "Выберите язык:", "en": "Choose language:", "ka": "აირჩიე ენა:"},
-
-    "wiz_intro": {"ru": "Выберите режим работы:", "en": "Choose mode:", "ka": "აირჩიეთ რეჟიმი:"},
     "btn_rent": {"ru": "🏘 Аренда", "en": "🏘 Rent", "ka": "🏘 ქირავდება"},
     "btn_sale": {"ru": "🏠 Продажа", "en": "🏠 Sale", "ka": "🏠 იყიდება"},
-
-    "ask_city": {"ru": "🏙 Выберите город:", "en": "🏙 Choose city:", "ka": "🏙 აირჩიეთ ქალაქი:"},
-    "ask_district": {"ru": "📍 Выберите район:", "en": "📍 Choose district:", "ka": "📍 აირჩიეთ რაიონი:"},
-    "ask_type": {"ru": "🏡 Выберите тип недвижимости:", "en": "🏡 Choose property type:", "ka": "🏡 აირჩიეთ ტიპი:"},
-    "ask_rooms": {"ru": "🚪 Количество комнат:", "en": "🚪 Rooms:", "ka": "🚪 ოთახების რაოდენობა:"},
-    "ask_price": {"ru": "💵 Бюджет:", "en": "💵 Budget:", "ka": "💵 ბიუჯეტი:"},
-
     "btn_skip": {"ru": "Пропустить", "en": "Skip", "ka": "გამოტოვება"},
     "btn_more": {"ru": "Ещё…", "en": "More…", "ka": "კიდევ…"},
-
-    "no_results": {"ru": "Ничего не найдено.", "en": "No results.", "ka": "ვერაფერი მოიძებნა."},
-    "results_found": {"ru": "Найдено объявлений: <b>{n}</b>", "en": "Listings found: <b>{n}</b>", "ka": "მოიძებნა განცხადება: <b>{n}</b>"},
-
     "btn_prev": {"ru": "« Назад", "en": "« Prev", "ka": "« უკან"},
     "btn_next": {"ru": "Вперёд »", "en": "Next »", "ka": "წინ »"},
     "btn_like": {"ru": "❤️ Нравится", "en": "❤️ Like", "ka": "❤️ მომეწონა"},
@@ -230,22 +242,34 @@ T = {
     "btn_fav_del": {"ru": "⭐ Удалить из избранного", "en": "⭐ Remove favorite", "ka": "⭐ წაშლა"},
     "btn_share": {"ru": "🔗 Поделиться", "en": "🔗 Share", "ka": "🔗 გაზიარება"},
 
-    "lead_ask": {
-        "ru": "Оставьте контакт (телефон или @username), и мы свяжем вас с владельцем:",
-        "en": "Leave your contact (phone or @username), we'll connect you with the owner:",
-        "ka": "მოგვაწოდეთ კონტაქტი (ტელეფონი ან @username), დაგაკავშირდებით მფლობელთან:"
+    "start": {
+        "ru": "<b>LivePlace</b>\n👋 Привет! Я помогу подобрать <b>идеальную недвижимость в Грузии</b>.\n\n<b>Как это работает?</b>\n— Задам 3–4 простых вопроса\n— Покажу лучшие варианты с фото и телефоном владельца\n— Просто посмотреть? Жми <b>🟢 Быстрый подбор</b>\n\nДобро пожаловать и удачного поиска! 🏡",
+        "en": "<b>LivePlace</b>\n👋 Hi! I'll help you find <b>your ideal home in Georgia</b>.\n\n<b>How it works:</b>\n— I ask 3–4 quick questions\n— Show top options with photos and owner phone\n— Just browsing? Tap <b>🟢 Quick picks</b>\n\nWelcome and happy hunting! 🏡",
+        "ka": "<b>LivePlace</b>\n👋 გამარჯობა! ერთად ვიპოვოთ <b>იდეალური ბინა საქართველოში</b>.\n\n<b>როგორ მუშაობს:</b>\n— 3–4 მარტივი კითხვა\n— საუკეთესო ვარიანტები ფოტოებითა და მფლობელის ნომრით\n— უბრალოდ გადაათვალიერე? დააჭირე <b>🟢 სწრაფი არჩევანი</b>\n\nკეთილი იყოს თქვენი მობრძანება! 🏡",
     },
+    "about": {
+        "ru": "LivePlace: быстрый подбор недвижимости в Грузии. Фильтры, 10 фото, телефон владельца, избранное.",
+        "en": "LivePlace: fast real-estate search in Georgia. Filters, 10 photos, owner phone, favorites.",
+        "ka": "LivePlace: უძრავი ქონების სწრაფი ძიება საქართველოში. ფილტრები, 10 ფოტო, მფლობელის ნომერი, რჩეულები."
+    },
+    "choose_lang": {"ru": "Выберите язык:", "en": "Choose language:", "ka": "აირჩიე ენა:"},
+    "wiz_intro": {"ru": "Выберите режим работы:", "en": "Choose mode:", "ka": "აირჩიეთ რეჟიმი:"},
+    "ask_city": {"ru": "🏙 Выберите город:", "en": "🏙 Choose city:", "ka": "🏙 აირჩიეთ ქალაქი:"},
+    "ask_district": {"ru": "📍 Выберите район:", "en": "📍 Choose district:", "ka": "📍 აირჩიეთ რაიონი:"},
+    "ask_type": {"ru": "🏡 Выберите тип недвижимости:", "en": "🏡 Choose property type:", "ka": "🏡 აირჩიეთ ტიპი:"},
+    "ask_rooms": {"ru": "🚪 Количество комнат:", "en": "🚪 Rooms:", "ka": "🚪 ოთახების რაოდენობა:"},
+    "ask_price": {"ru": "💵 Бюджет:", "en": "💵 Budget:", "ka": "💵 ბიუჯეტი:"},
+    "no_results": {"ru": "Ничего не найдено.", "en": "No results.", "ka": "ვერაფერი მოიძებნა."},
+    "results_found": {"ru": "Найдено объявлений: <b>{n}</b>", "en": "Listings found: <b>{n}</b>", "ka": "მოიძებნა განცხადება: <b>{n}</b>"},
+    "lead_ask": {"ru": "Оставьте контакт (телефон или @username), и мы свяжем вас с владельцем:", "en": "Leave your contact (phone or @username), we'll connect you with the owner:", "ka": "მოგვაწოდეთ კონტაქტი (ტელეფონი ან @username), დაგაკავშირდებით მფლობელთან:"},
     "lead_ok": {"ru": "Спасибо! Передали менеджеру.", "en": "Thanks! Sent to manager.", "ka": "მადლობა! გადაგზავნილია მენეჯერთან."},
-
     "label_price": {"ru":"Цена", "en":"Price", "ka":"ფასი"},
     "label_pub": {"ru":"Опубликовано", "en":"Published", "ka":"გამოქვეყნდა"},
     "label_phone": {"ru":"Телефон", "en":"Phone", "ka":"ტელეფონი"},
-
     "toast_removed": {"ru":"Удалено", "en":"Removed", "ka":"წაშლილია"},
     "toast_saved": {"ru":"Сохранено в избранное", "en":"Saved to favorites", "ka":"რჩეულებში შენახულია"},
     "toast_next": {"ru":"Следующее", "en":"Next", "ka":"შემდეგი"},
     "toast_no_more": {"ru":"Больше объявлений нет", "en":"No more listings", "ka":"სხვა განცხადება აღარ არის"},
-
     "lead_invalid": {"ru":"Оставьте телефон (+995...) или @username.", "en":"Please leave a phone (+995...) or @username.", "ka":"გთხოვთ მიუთითოთ ტელეფონი (+995...) ან @username."},
     "lead_too_soon": {"ru":"Чуть позже, заявка уже отправлена.", "en":"Please wait, your request was just sent.", "ka":"გთხოვთ მოიცადოთ, თქვენი განაცხადი უკვე გაიგზავნა."},
 }
@@ -278,15 +302,15 @@ def build_utm_url(raw: str, ad_id: str, uid: int) -> str:
     seed = f"{uid}:{datetime.utcnow().strftime('%Y%m%d')}:{ad_id}".encode("utf-8")
     token = hashlib.sha256(seed).hexdigest()[:16]
     u = urlparse(raw); q = parse_qs(u.query)
-    q["utm_source"]   = [UTM_SOURCE]
-    q["utm_medium"]   = [UTM_MEDIUM]
-    q["utm_campaign"] = [UTM_CAMPAIGN]
-    q["utm_content"]  = [ad_id]
-    q["token"]        = [token]
+    q["utm_source"] = [Config.UTM_SOURCE]
+    q["utm_medium"] = [Config.UTM_MEDIUM]
+    q["utm_campaign"] = [Config.UTM_CAMPAIGN]
+    q["utm_content"] = [ad_id]
+    q["token"] = [token]
     new_q = urlencode({k: v[0] for k, v in q.items()})
     return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
-# ---- Menus
+# ---- Menu System ----
 def main_menu(lang: str) -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton(T["btn_fast"][lang]))
@@ -295,18 +319,7 @@ def main_menu(lang: str) -> ReplyKeyboardMarkup:
     kb.add(KeyboardButton(T["btn_language"][lang]), KeyboardButton(T["btn_about"][lang]))
     return kb
 
-# ---- Auto-refresh cache
-async def _auto_refresh_loop():
-    while True:
-        try:
-            if _is_cache_stale():
-                await rows_async(force=True)
-                logger.info("Sheets cache refreshed")
-        except Exception as e:
-            logger.warning(f"Auto refresh failed: {e}")
-        await asyncio.sleep(30)
-
-# ===== Utilities / cards / favorites =====
+# ---- Utilities ----
 def norm(s: str) -> str:
     return (s or "").strip().lower()
 
@@ -363,16 +376,16 @@ def parse_rooms(v: Any) -> float:
 
 def format_card(row: Dict[str, Any], lang: str) -> str:
     title_k = LANG_FIELDS[lang]["title"]
-    desc_k  = LANG_FIELDS[lang]["desc"]
-    city      = str(row.get("city", "")).strip()
-    district  = str(row.get("district", "")).strip()
-    rtype     = str(row.get("type", "")).strip()
-    rooms     = str(row.get("rooms", "")).strip()
-    price     = str(row.get("price", "")).strip()
+    desc_k = LANG_FIELDS[lang]["desc"]
+    city = str(row.get("city", "")).strip()
+    district = str(row.get("district", "")).strip()
+    rtype = str(row.get("type", "")).strip()
+    rooms = str(row.get("rooms", "")).strip()
+    price = str(row.get("price", "")).strip()
     published = str(row.get("published", "")).strip()
-    phone     = str(row.get("phone", "")).strip()
-    title     = str(row.get(title_k, "")).strip()
-    desc      = str(row.get(desc_k, "")).strip()
+    phone = str(row.get("phone", "")).strip()
+    title = str(row.get(title_k, "")).strip()
+    desc = str(row.get(desc_k, "")).strip()
 
     pub_txt = published
     try:
@@ -399,20 +412,19 @@ def format_card(row: Dict[str, Any], lang: str) -> str:
         lines.append("—")
     return "\n".join(lines)
 
+# ---- User Data Management ----
 PAGE_SIZE = 8
-# Для списков выбора теперь храним пары (label, value), чтобы фильтр работал по базовой value,
-# а кнопки отображались локализованным label
 CHOICE_CACHE: Dict[int, Dict[str, List[Tuple[str, str]]]] = {}
 CHOICE_MSG: Dict[int, Dict[str, int]] = {}
-
+USER_RESULTS: Dict[int, Dict[str, Any]] = {}
+USER_FAVS: Dict[int, List[str]] = {}
 LEAD_COOLDOWN = 45
 LAST_LEAD_AT: Dict[int, float] = {}
-
 LAST_AD_ID: Dict[int, str] = {}
+LAST_AD_TIME: Dict[int, float] = {}
 
-# ===== Локализация списков городов/районов =====
+# ---- Localization for Choices ----
 def _l10n_label(row: Dict[str, Any], field: str, lang: str) -> str:
-    """Возвращает надпись для кнопки (локализованную) для поля city/district."""
     base = str(row.get(field, "")).strip()
     if field not in ("city", "district"):
         return base
@@ -423,8 +435,6 @@ def _l10n_label(row: Dict[str, Any], field: str, lang: str) -> str:
 
 def unique_values_l10n(rows: List[Dict[str, Any]], field: str, lang: str,
                        where: Optional[List[Tuple[str, str]]] = None) -> List[Tuple[str, str]]:
-    """Собирает уникальные значения field c метками по языку: [(label, base_value)].
-       Дедупликация по base_value (значение базовой колонки)."""
     out: List[Tuple[str,str]] = []
     seen: set = set()
     for r in rows:
@@ -442,19 +452,13 @@ def unique_values_l10n(rows: List[Dict[str, Any]], field: str, lang: str,
         label = _l10n_label(r, field, lang)
         seen.add(base)
         out.append((label, base))
-    # Сортируем по label (отображаемому тексту)
     out.sort(key=lambda x: x[0])
     return out
 
-# ====== РЕКЛАМА ======
-ADS_ENABLED        = os.getenv("ADS_ENABLED", "1").strip() not in {"0", "false", "False", ""}
-ADS_PROB           = float(os.getenv("ADS_PROB", "0.18"))
-ADS_COOLDOWN_SEC   = int(os.getenv("ADS_COOLDOWN_SEC", "180"))
-LAST_AD_TIME: Dict[int, float] = {}
-
+# ---- Advertising System ----
 ADS = [
     {"id":"lead_form","text_ru":"🔥 Ищете квартиру быстрее? Оставьте заявку на сайте — подберём за 24 часа!",
-     "text_en":"🔥 Need a place fast? Leave a request on our website — we’ll find options within 24h!",
+     "text_en":"🔥 Need a place fast? Leave a request on our website — we'll find options within 24h!",
      "text_ka":"🔥 ბინა გჭირდებათ სწრაფად? დატოვეთ განაცხადი საიტზე — 24 საათში მოვძებნით ვარიანტებს!",
      "url":"https://liveplace.com.ge/lead","photo":""},
     {"id":"mortgage_help","text_ru":"🏦 Поможем с ипотекой для нерезидентов в Грузии. Узнайте детали на сайте.",
@@ -466,19 +470,19 @@ ADS = [
      "text_ka":"🏘 ნახეთ გაქირავების ახალი ბინები — განახლებული განცხადებები საიტზე.",
      "url":"https://liveplace.com.ge/rent","photo":""},
     {"id":"sell_service","text_ru":"💼 Хотите продать квартиру? Оценим и разместим ваше объявление на LivePlace.",
-     "text_en":"💼 Selling your property? We’ll valuate and list it on LivePlace.",
+     "text_en":"💼 Selling your property? We'll valuate and list it on LivePlace.",
      "text_ka":"💼 ყიდით ბინას? შევაფასებთ და დავდებთ LivePlace-ზე.",
      "url":"https://liveplace.com.ge/sell","photo":""},
 ]
 
 def should_show_ad(uid: int) -> bool:
-    if not ADS_ENABLED or not ADS:
+    if not Config.ADS_ENABLED or not ADS:
         return False
     now = time.time()
     last = LAST_AD_TIME.get(uid, 0.0)
-    if now - last < ADS_COOLDOWN_SEC:
+    if now - last < Config.ADS_COOLDOWN_SEC:
         return False
-    return random.random() < ADS_PROB
+    return random.random() < Config.ADS_PROB
 
 def pick_ad(uid: int, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     mode = context.get("mode", "")
@@ -519,7 +523,7 @@ async def maybe_show_ad(message_or_cb, uid: int, context: Dict[str, Any]):
     except Exception as e:
         logger.warning(f"maybe_show_ad failed: {e}")
 
-# ===== Guided choices =====
+# ---- Search States ----
 class Search(StatesGroup):
     mode = State()
     city = State()
@@ -528,10 +532,7 @@ class Search(StatesGroup):
     rooms = State()
     price = State()
 
-USER_RESULTS: Dict[int, Dict[str, Any]] = {}
-USER_FAVS: Dict[int, List[str]] = {}
-
-# =====================  АНАЛИТИКА  =====================
+# ---- Analytics System ----
 def _today_str():
     return datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -542,8 +543,8 @@ AGG_CITY = defaultdict(lambda: Counter())
 AGG_DISTRICT = defaultdict(lambda: Counter())
 AGG_FUNNEL = defaultdict(lambda: Counter())
 TOP_LISTINGS = defaultdict(lambda: Counter())
-TOP_LIKES    = defaultdict(lambda: Counter())
-TOP_FAVS     = defaultdict(lambda: Counter())
+TOP_LIKES = defaultdict(lambda: Counter())
+TOP_FAVS = defaultdict(lambda: Counter())
 
 ANALYTICS_SNAPSHOT = "analytics_snapshot.json"
 SNAPSHOT_INTERVAL_SEC = 120
@@ -661,15 +662,7 @@ def export_analytics_csv(path: str = "analytics_export.csv"):
             w.writerow({k: ev.get(k,"") for k in keys})
     return path
 
-# ====== Analytics snapshot (persist) ======
-async def _snapshot_loop():
-    while True:
-        try:
-            save_analytics_snapshot()
-        except Exception as e:
-            logger.warning(f"snapshot save failed: {e}")
-        await asyncio.sleep(SNAPSHOT_INTERVAL_SEC)
-
+# ---- Analytics Persistence ----
 def save_analytics_snapshot():
     data = {
       "ANALYTIC_EVENTS": ANALYTIC_EVENTS,
@@ -712,12 +705,12 @@ def load_analytics_snapshot():
     except Exception as e:
         logger.warning(f"load snapshot failed: {e}")
 
-# ====== Google Sheets для статистики (опционально) ======
+# ---- Google Sheets Statistics ----
 def _open_stats_book():
-    if not GSHEET_STATS_ID:
+    if not Config.GSHEET_STATS_ID:
         raise RuntimeError("GSHEET_STATS_ID is not set")
     try:
-        return gc.open_by_key(GSHEET_STATS_ID)
+        return sheets_manager.get_client().open_by_key(Config.GSHEET_STATS_ID)
     except Exception as e:
         raise RuntimeError("Cannot open GSHEET_STATS_ID (check sharing/ID)") from e
 
@@ -777,65 +770,161 @@ def push_day_all(day: str):
     push_daily_to_sheet(day)
     push_top_to_sheet(day)
 
-# ===================  /АНАЛИТИКА  ======================
+# ---- Background Tasks Management ----
+_background_tasks = set()
 
-async def on_startup(dp):
-    try:
-        await rows_async(force=True)
-    except Exception as e:
-        logger.warning(f"Preload failed: {e}")
-    load_analytics_snapshot()
-    asyncio.create_task(_auto_refresh_loop())
-    asyncio.create_task(_midnight_flush_loop())
-    asyncio.create_task(_weekly_report_loop())
-    asyncio.create_task(_snapshot_loop())
-    logger.info(f"Admin IDs loaded: {sorted(ADMINS_SET)}")
+async def create_background_task(coro, task_name: str):
+    """Safely create and track background tasks"""
+    task = asyncio.create_task(coro, name=task_name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
-# ---- Фоновые задачи
+async def _auto_refresh_loop():
+    """Improved auto-refresh with exponential backoff"""
+    error_count = 0
+    base_delay = 30
+    max_delay = 300
+    
+    while True:
+        try:
+            if _is_cache_stale():
+                await rows_async(force=True)
+                error_count = 0
+                logger.debug("Sheets cache refreshed successfully")
+                
+            delay = base_delay
+            await asyncio.sleep(delay)
+            
+        except Exception as e:
+            error_count += 1
+            delay = min(base_delay * (2 ** min(error_count, 5)), max_delay)
+            delay *= random.uniform(0.8, 1.2)
+            
+            logger.error(f"Auto refresh failed (attempt {error_count}), retrying in {delay:.1f}s: {e}")
+            await asyncio.sleep(delay)
+
 async def _midnight_flush_loop():
-    """Каждый день в 00:05 UTC пишет статистику вчерашнего дня в Google Sheets."""
-    already = set()
+    """Improved midnight flush with error handling"""
+    already_processed = set()
+    
     while True:
         try:
             now = datetime.utcnow()
-            mark = now.strftime("%Y-%m-%d %H:%M")
-            if now.hour == 0 and now.minute >= 5 and mark not in already:
+            if now.hour == 0 and now.minute >= 5:
                 day = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-                if GSHEET_STATS_ID:
-                    try:
-                        await asyncio.to_thread(push_day_all, day)
-                        logger.info(f"Pushed analytics for {day}")
-                    except Exception as e:
-                        logger.warning(f"Push analytics failed for {day}: {e}")
-                already.add(mark)
+                mark = f"{day}-flush"
+                
+                if mark not in already_processed:
+                    if Config.GSHEET_STATS_ID:
+                        try:
+                            await asyncio.to_thread(push_day_all, day)
+                            already_processed.add(mark)
+                            logger.info(f"Successfully pushed analytics for {day}")
+                        except Exception as e:
+                            logger.error(f"Failed to push analytics for {day}: {e}")
+                    else:
+                        already_processed.add(mark)
+            
+            cutoff = (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%d")
+            already_processed = {m for m in already_processed if m.split("-")[0] >= cutoff}
+            
         except Exception as e:
-            logger.warning(f"_midnight_flush_loop error: {e}")
-        await asyncio.sleep(30)
+            logger.error(f"Midnight flush loop error: {e}")
+        
+        await asyncio.sleep(60)
 
 async def _weekly_report_loop():
-    """Еженедельный отчёт админу (по умолчанию пн 09:00 UTC)."""
-    sent_days = set()
+    """Improved weekly report with error handling"""
+    sent_reports = set()
+    
     while True:
         try:
             now = datetime.utcnow()
-            dow = (now.isoweekday())  # 1..7
-            if dow == WEEKLY_REPORT_DOW and now.hour == WEEKLY_REPORT_HOUR and now.minute < 5:
-                key = now.strftime("%Y-%m-%d-%H")
-                if key not in sent_days:
-                    text = render_week_summary()
+            dow = now.isoweekday()
+            
+            if (dow == Config.WEEKLY_REPORT_DOW and 
+                now.hour == Config.WEEKLY_REPORT_HOUR and 
+                now.minute < 5):
+                
+                report_key = now.strftime("%Y-%U")
+                
+                if report_key not in sent_reports:
                     try:
-                        await bot.send_message(ADMIN_CHAT_ID, text)
+                        text = render_week_summary()
+                        await bot.send_message(Config.ADMIN_CHAT_ID, text)
+                        sent_reports.add(report_key)
+                        logger.info("Weekly report sent successfully")
                     except Exception as e:
-                        logger.warning(f"Weekly report send failed: {e}")
-                    sent_days.add(key)
+                        logger.error(f"Failed to send weekly report: {e}")
+            
+            current_year = datetime.utcnow().year
+            sent_reports = {r for r in sent_reports if r.startswith(str(current_year))}
+            
         except Exception as e:
-            logger.warning(f"_weekly_report_loop error: {e}")
-        await asyncio.sleep(30)
+            logger.error(f"Weekly report loop error: {e}")
+        
+        await asyncio.sleep(300)
 
-# ====== Handlers ======
+async def _snapshot_loop():
+    """Improved snapshot loop with error handling"""
+    while True:
+        try:
+            save_analytics_snapshot()
+        except Exception as e:
+            logger.error(f"Snapshot save failed: {e}")
+        await asyncio.sleep(SNAPSHOT_INTERVAL_SEC)
+
+# ---- Startup and Shutdown ----
+async def on_startup(dp):
+    """Improved startup with proper task management"""
+    try:
+        await rows_async(force=True)
+        logger.info("Initial data loaded successfully")
+    except Exception as e:
+        logger.error(f"Initial data load failed: {e}")
+    
+    load_analytics_snapshot()
+    
+    tasks = [
+        ("auto_refresh", _auto_refresh_loop()),
+        ("midnight_flush", _midnight_flush_loop()),
+        ("weekly_report", _weekly_report_loop()),
+        ("snapshot", _snapshot_loop())
+    ]
+    
+    for task_name, task_coro in tasks:
+        try:
+            await create_background_task(task_coro, task_name)
+            logger.info(f"Started background task: {task_name}")
+        except Exception as e:
+            logger.error(f"Failed to start background task {task_name}: {e}")
+    
+    logger.info(f"Bot started successfully. Admin IDs: {sorted(ADMINS_SET)}")
+
+async def on_shutdown(dp):
+    """Clean shutdown handler"""
+    logger.info("Shutting down bot...")
+    
+    for task in _background_tasks:
+        task.cancel()
+    
+    if _background_tasks:
+        await asyncio.wait(_background_tasks, timeout=5.0)
+    
+    await bot.close()
+    
+    if _singleton_lock:
+        try:
+            _singleton_lock.close()
+        except Exception:
+            pass
+    
+    logger.info("Bot shutdown complete")
+
+# ---- Handlers ----
 @dp.message_handler(commands=["start", "menu"])
 async def cmd_start(message: types.Message, state: FSMContext):
-    # авто-определение языка по language_code при первом старте
     if message.from_user.id not in USER_LANG:
         code = (message.from_user.language_code or "").strip()
         USER_LANG[message.from_user.id] = LANG_MAP.get(code, "ru")
@@ -867,13 +956,13 @@ async def cmd_admin_debug(message: types.Message, state: FSMContext):
         return await message.answer("Нет доступа.")
     await message.answer(
         "Debug:\n"
-        f"ADMIN_CHAT_ID: <code>{ADMIN_CHAT_ID}</code>\n"
+        f"ADMIN_CHAT_ID: <code>{Config.ADMIN_CHAT_ID}</code>\n"
         f"ADMINS (.env): <code>{os.getenv('ADMINS','')}</code>\n"
         f"ADMINS_SET: <code>{sorted(ADMINS_SET)}</code>\n"
-        f"GSHEET_STATS_ID: <code>{GSHEET_STATS_ID or '(not set)'}</code>\n"
-        f"Weekly: DOW={WEEKLY_REPORT_DOW}, HOUR={WEEKLY_REPORT_HOUR} (UTC)\n"
-        f"ADS: enabled={ADS_ENABLED}, prob={ADS_PROB}, cooldown={ADS_COOLDOWN_SEC}s\n"
-        f"Cache rows: {len(_cached_rows)}, TTLmin={GSHEET_REFRESH_MIN}"
+        f"GSHEET_STATS_ID: <code>{Config.GSHEET_STATS_ID or '(not set)'}</code>\n"
+        f"Weekly: DOW={Config.WEEKLY_REPORT_DOW}, HOUR={Config.WEEKLY_REPORT_HOUR} (UTC)\n"
+        f"ADS: enabled={Config.ADS_ENABLED}, prob={Config.ADS_PROB}, cooldown={Config.ADS_COOLDOWN_SEC}s\n"
+        f"Cache rows: {len(_cached_rows)}, TTLmin={Config.GSHEET_REFRESH_MIN}"
     )
 
 @dp.message_handler(commands=["health"])
@@ -884,10 +973,10 @@ async def cmd_health(message: types.Message):
         ws = await asyncio.to_thread(get_worksheet)
         header = ws.row_values(1)
         sample = ws.row_values(2)
-        stats = f"stats_book={'set' if GSHEET_STATS_ID else 'unset'}"
+        stats = f"stats_book={'set' if Config.GSHEET_STATS_ID else 'unset'}"
         await message.answer(
             "✅ Connected\n"
-            f"Tab: <b>{GSHEET_TAB}</b>\n"
+            f"Tab: <b>{Config.GSHEET_TAB}</b>\n"
             f"Tabs: {tabs}\n"
             f"Header: {header}\n"
             f"Row2: {sample}\n"
@@ -913,7 +1002,7 @@ async def cmd_reload(message: types.Message):
     except Exception as e:
         await message.answer(f"Reload error: {e}")
 
-# ----- ANALYTICS COMMANDS -----
+# ---- Analytics Commands ----
 @dp.message_handler(commands=["stats", "stats_today"], state="*")
 async def cmd_stats(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -949,9 +1038,9 @@ async def cmd_top_week(message: types.Message, state: FSMContext):
     counters = {"views": Counter(), "likes": Counter(), "favorites": Counter()}
     for i in range(7):
         d = (end_dt - timedelta(days=i)).strftime("%Y-%m-%d")
-        counters["views"]      += TOP_LISTINGS[d]
-        counters["likes"]      += TOP_LIKES[d]
-        counters["favorites"]  += TOP_FAVS[d]
+        counters["views"] += TOP_LISTINGS[d]
+        counters["likes"] += TOP_LIKES[d]
+        counters["favorites"] += TOP_FAVS[d]
     txt = [
         "🏆 ТОП за 7 дней:",
         "Просмотры: " + (", ".join([f"{k}:{n}" for k,n in counters["views"].most_common(10)]) or "—"),
@@ -964,7 +1053,7 @@ async def cmd_top_week(message: types.Message, state: FSMContext):
 async def cmd_stats_push(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа.")
-    if not GSHEET_STATS_ID:
+    if not Config.GSHEET_STATS_ID:
         return await message.answer("GSHEET_STATS_ID не задан. Добавь в .env и дай сервисному аккаунту права редактора.")
     parts = (message.text or "").split(maxsplit=1)
     day = parts[1].strip() if len(parts) == 2 else _today_str()
@@ -981,7 +1070,7 @@ async def cmd_export(message: types.Message, state: FSMContext):
     path = export_analytics_csv("analytics_export.csv")
     await message.answer_document(types.InputFile(path), caption="Экспорт аналитики (CSV)")
 
-# ====== ЯЗЫК ======
+# ---- Language Handlers ----
 @dp.message_handler(lambda m: m.text in (T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"]), state="*")
 async def on_language(message: types.Message, state: FSMContext):
     current = USER_LANG.get(message.from_user.id, "ru")
@@ -1032,7 +1121,7 @@ async def on_fast(message: types.Message):
     await message.answer(t(lang, "results_found", n=len(rows_sorted[:30])))
     await show_current_card(message, message.from_user.id)
 
-# ====== Поиск ======
+# ---- Search Handlers ----
 @dp.message_handler(lambda m: m.text in (T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"]))
 async def on_search(message: types.Message, state: FSMContext):
     lang = USER_LANG.get(message.from_user.id, "ru")
@@ -1068,13 +1157,11 @@ async def st_mode(message: types.Message, state: FSMContext):
     await state.update_data(_city_shown=True)
 
     rows = await rows_async()
-    # Локализуем список городов
     cities = unique_values_l10n(rows, "city", lang)
     await Search.city.set()
     await send_choice(message, lang, "city", cities, 0, t(lang, "ask_city"))
 
 async def send_choice(message, lang: str, field: str, values: List[Tuple[str,str]], page: int, prompt: str, allow_skip=True):
-    """values: list of (label, value)."""
     chat_id = message.chat.id if hasattr(message, "chat") else message.from_user.id
     CHOICE_CACHE.setdefault(chat_id, {})[field] = values
 
@@ -1111,11 +1198,9 @@ async def cb_more(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if field == "district" and data.get("city"):
         where.append(("city", data["city"]))
-    # Локализуем и города, и районы. Для type оставим как есть.
     if field in ("city", "district"):
         values = unique_values_l10n(rows, field, lang, where)
     else:
-        # Не локализованные списки (например type)
         raw = []
         seen = set()
         for r in rows:
@@ -1164,7 +1249,7 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
         value = ""
         if 0 <= idx < len(cache_list):
             label, base = cache_list[idx]
-            value = base  # сохраняем БАЗОВОЕ значение для фильтрации
+            value = base
 
         await state.update_data(**{field: value})
         rows = await rows_async()
@@ -1186,11 +1271,9 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
                 filters.append(("city", city_val))
             if value:
                 filters.append(("district", value))
-            # type без локализации
             types = unique_values_l10n(rows, "type", lang, filters if filters else None)
-            # но для type label=value
             types = [(lbl if f!="type" else base, base) for (lbl, base), f in zip(types, ["type"]*len(types))] if types else []
-            if not types:  # fallback без zip-трюка
+            if not types:
                 seen=set(); types=[]
                 for r in rows:
                     ok=True
@@ -1368,7 +1451,6 @@ async def show_current_card(message_or_cb, user_id: int):
     kb = card_kb(idx, total, lang, is_fav)
 
     async def _send_with_photos(msg_obj, text: str, kb: InlineKeyboardMarkup, photos: List[str]):
-        # 1) Альбом
         if len(photos) >= 2:
             try:
                 media = []
@@ -1381,13 +1463,11 @@ async def show_current_card(message_or_cb, user_id: int):
                     else:
                         media.append(InputMediaPhoto(media=url))
                 await msg_obj.answer_media_group(media)
-                # отдельным сообщением — чтобы не было "Text must be non-empty"
-                await msg_obj.answer("\u2063", reply_markup=kb)  # \u2063 — невидимый символ
+                await msg_obj.answer("\u2063", reply_markup=kb)
                 return
             except Exception as e:
                 logger.warning(f"media_group failed: {e}")
 
-        # 2) Одна фотка
         if len(photos) == 1:
             try:
                 if text and text.strip():
@@ -1399,7 +1479,6 @@ async def show_current_card(message_or_cb, user_id: int):
             except Exception as e:
                 logger.warning(f"single photo failed: {e}")
 
-        # 3) Без фото
         if text and text.strip():
             await msg_obj.answer(text, reply_markup=kb)
         else:
@@ -1479,7 +1558,7 @@ async def cb_like(c: CallbackQuery, state: FSMContext):
         format_card(row, lang)
     )
     try:
-        target = FEEDBACK_CHAT_ID or ADMIN_CHAT_ID
+        target = Config.FEEDBACK_CHAT_ID or Config.ADMIN_CHAT_ID
         if target:
             await bot.send_message(chat_id=target, text=pre_msg)
     except Exception as e:
@@ -1528,32 +1607,29 @@ async def on_favs(message: types.Message, state: FSMContext):
     await message.answer(f"Избранное: {len(picked)}")
     await show_current_card(message, message.from_user.id)
 
-# =====================  АДМИН: РЕКЛАМА =====================
+# ---- Advertising Commands ----
 @dp.message_handler(commands=["ads_on"])
 async def ads_on(message: types.Message):
     if not is_admin(message.from_user.id):
         return
-    global ADS_ENABLED
-    ADS_ENABLED = True
+    Config.ADS_ENABLED = True
     await message.answer("✅ Реклама включена")
 
 @dp.message_handler(commands=["ads_off"])
 async def ads_off(message: types.Message):
     if not is_admin(message.from_user.id):
         return
-    global ADS_ENABLED
-    ADS_ENABLED = False
+    Config.ADS_ENABLED = False
     await message.answer("⛔ Реклама выключена")
 
 @dp.message_handler(commands=["ads_prob"])
 async def ads_prob(message: types.Message):
     if not is_admin(message.from_user.id):
         return
-    global ADS_PROB
     try:
         val = float(message.get_args())
         if 0 <= val <= 1:
-            ADS_PROB = val
+            Config.ADS_PROB = val
             await message.answer(f"🔄 Вероятность показа рекламы обновлена: {val*100:.0f}%")
         else:
             await message.answer("⚠ Укажи число от 0 до 1 (например, 0.25)")
@@ -1564,10 +1640,9 @@ async def ads_prob(message: types.Message):
 async def ads_cooldown(message: types.Message):
     if not is_admin(message.from_user.id):
         return
-    global ADS_COOLDOWN_SEC
     try:
         val = int(message.get_args())
-        ADS_COOLDOWN_SEC = val
+        Config.ADS_COOLDOWN_SEC = val
         await message.answer(f"⏱ Кулдаун показа рекламы обновлён: {val} сек.")
     except Exception:
         await message.answer("❌ Использование: /ads_cooldown 300")
@@ -1606,18 +1681,16 @@ async def ads_stats(message: types.Message):
     txt.append(f"ИТОГО: {total}")
     await message.answer("\n".join(txt))
 
-# ----- Общий обработчик НЕ-команд -----
+# ---- Text Message Handler ----
 @dp.message_handler(lambda m: not ((m.text or "").startswith("/")) and not m.from_user.is_bot, state="*")
 async def any_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
 
-    # Если ждём контакт для лида — обработать и выйти
     if data.get("want_contact"):
         contact = (message.text or "").strip()
         user = message.from_user
         lang = USER_LANG.get(user.id, "ru")
 
-        # Простая валидация
         is_phone = re.fullmatch(r"\+?\d[\d\-\s]{7,}", contact or "") is not None
         is_username = (contact or "").startswith("@") and len(contact) >= 5
         now = time.time()
@@ -1638,7 +1711,7 @@ async def any_text(message: types.Message, state: FSMContext):
                 f"Contact: {contact}\n\n" +
                 (format_card(row, lang) if row else "(no current listing)")
             )
-            target = FEEDBACK_CHAT_ID or ADMIN_CHAT_ID
+            target = Config.FEEDBACK_CHAT_ID or Config.ADMIN_CHAT_ID
             if target:
                 await bot.send_message(chat_id=target, text=lead_msg)
             try:
@@ -1653,7 +1726,6 @@ async def any_text(message: types.Message, state: FSMContext):
         await state.update_data(want_contact=False)
         return await message.answer(t(lang, "lead_ok"), reply_markup=main_menu(lang))
 
-    # Игнорируем «наши» известные кнопки — их уже ловят свои хендлеры
     KNOWN = {
         T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"],
         T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"],
@@ -1665,13 +1737,39 @@ async def any_text(message: types.Message, state: FSMContext):
         T["btn_daily"]["ru"], T["btn_daily"]["en"], T["btn_daily"]["ka"],
     }
     if (message.text or "") in KNOWN:
-        return  # ничего не отвечаем — конкретные хендлеры уже обработают
+        return
 
-    # По умолчанию — вернуть в меню
     lang = USER_LANG.get(message.from_user.id, "ru")
     await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
 
-# ---- Run
+# ---- Main Execution ----
 if __name__ == "__main__":
-    logger.info("LivePlace bot is running…")
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    try:
+        logger.info("Starting LivePlace bot with stability improvements...")
+        
+        executor.start_polling(
+            dp, 
+            skip_updates=True, 
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            timeout=30,
+            relax=0.1
+        )
+        
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+    finally:
+        try:
+            asyncio.run(on_shutdown(dp))
+        except Exception:
+            pass
+        
+        if _singleton_lock:
+            try:
+                _singleton_lock.close()
+            except Exception:
+                pass
+        
+        logger.info("Bot process ended")
