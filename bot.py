@@ -19,8 +19,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter, defaultdict
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import (
@@ -1883,64 +1883,24 @@ async def cmd_status(message: types.Message):
     await message.answer("\n".join(status_info))
 
 # ---- Main Execution with Process Cleanup ----
-async def main():
-    """Main async function for Aiogram 3.x"""
+if __name__ == "__main__":
     try:
         logger.info("Starting LivePlace bot with improved stability...")
         
-        # Load initial data and analytics BEFORE starting bot
-        try:
-            await rows_async(force=True)
-            logger.info("Initial data loaded successfully")
-        except Exception as e:
-            logger.error(f"Initial data load failed: {e}")
-            logger.info("Bot will start with empty cache and retry in background")
-        
-        # Load analytics snapshot
-        try:
-            load_analytics_snapshot()
-        except Exception as e:
-            logger.warning(f"Failed to load analytics snapshot: {e}")
-        
         # Clean up any stale webhook
         try:
-            await bot.delete_webhook(drop_pending_updates=True)
+            asyncio.run(bot.delete_webhook(drop_pending_updates=True))
         except Exception:
             pass
         
-        # Start background tasks
-        tasks = [
-            ("auto_refresh", _auto_refresh_loop()),
-            ("midnight_flush", _midnight_flush_loop()),
-            ("weekly_report", _weekly_report_loop()),
-            ("snapshot", _snapshot_loop())
-        ]
-        
-        for task_name, task_coro in tasks:
-            try:
-                await create_background_task(task_coro, task_name)
-                logger.info(f"Started background task: {task_name}")
-            except Exception as e:
-                logger.error(f"Failed to start background task {task_name}: {e}")
-        
-        logger.info(f"Bot started successfully. Admin IDs: {sorted(ADMINS_SET)}")
-        logger.info(f"Cache status: {len(_cached_rows)} rows loaded")
-        
-        # Send startup notification to admin
-        if Config.ADMIN_CHAT_ID:
-            try:
-                cache_status = f"{len(_cached_rows)} rows" if _cached_rows else "EMPTY"
-                await bot.send_message(
-                    Config.ADMIN_CHAT_ID,
-                    f"🤖 Bot started successfully\n"
-                    f"📊 Cache: {cache_status}\n"
-                    f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send startup notification: {e}")
-        
-        # Start polling
-        await dp.start_polling(bot)
+        executor.start_polling(
+            dp, 
+            skip_updates=True, 
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            timeout=60,
+            relax=1.0
+        )
         
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
@@ -1950,21 +1910,17 @@ async def main():
         # Try to send crash notification
         if Config.ADMIN_CHAT_ID:
             try:
-                await bot.send_message(
+                asyncio.run(bot.send_message(
                     Config.ADMIN_CHAT_ID,
                     f"🚨 Bot crashed:\n{str(e)}"
-                )
+                ))
             except Exception:
                 pass
     finally:
         # Ensure cleanup happens
-        await on_shutdown(dp)
+        try:
+            asyncio.run(on_shutdown(dp))
+        except Exception as e:
+            logger.error(f"Error during final cleanup: {e}")
+        
         logger.info("Bot process ended")
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user (Ctrl+C)")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
