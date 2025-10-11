@@ -20,15 +20,15 @@ from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter, defaultdict
 
 # ---- Aiogram 3.x Imports ----
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.filters.text import Text
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
 )
-from aiogram.filters import Command, Text
 
 # ---- Configuration and Logging ----
 try:
@@ -68,7 +68,10 @@ def ensure_singleton():
                         os.remove(lock_file_path)
             except (ValueError, IOError):
                 # Lock file is corrupted, remove it
-                os.remove(lock_file_path)
+                try:
+                    os.remove(lock_file_path)
+                except Exception:
+                    pass
         
         # Create new lock file
         lock_file = open(lock_file_path, 'w')
@@ -1011,8 +1014,11 @@ async def shutdown():
     logger.info("Shutting down bot...")
     
     # Cancel all background tasks
-    for task in _background_tasks:
-        task.cancel()
+    for task in list(_background_tasks):
+        try:
+            task.cancel()
+        except Exception:
+            pass
     
     if _background_tasks:
         try:
@@ -1036,8 +1042,11 @@ async def shutdown():
     if _singleton_lock:
         try:
             lock_file_path = "/tmp/liveplace_bot.lock"
-            if os.path.exists(lock_file_path):
-                os.remove(lock_file_path)
+            try:
+                if os.path.exists(lock_file_path):
+                    os.remove(lock_file_path)
+            except Exception:
+                pass
             _singleton_lock.close()
         except Exception as e:
             logger.warning(f"Error removing lock file: {e}")
