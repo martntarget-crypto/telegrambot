@@ -11,6 +11,12 @@ import re
 import csv
 import asyncio
 import logging
+print("RAILWAY ENV DEBUG:", {
+    "SHEETS_ENABLED": os.getenv("SHEETS_ENABLED"),
+    "GSHEET_ID": os.getenv("GSHEET_ID"),
+    "GSHEET_TAB": os.getenv("GSHEET_TAB"),
+    "HAS_CREDENTIALS": bool(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+})
 import random
 import time
 import json
@@ -1025,6 +1031,7 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
 
 
 
