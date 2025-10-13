@@ -112,15 +112,65 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # ---------------------------------------------------------------------
-#  Sheets subsystem — DISABLED mode with safe stubs
+#  Google Sheets subsystem — ENABLED via GOOGLE_CREDENTIALS_JSON
 # ---------------------------------------------------------------------
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 
-class SheetsManagerDisabled:
+class SheetsManager:
     def __init__(self):
-        self.enabled = False
+        self._gc = None
+        self._ws = None
 
     def get_client(self):
-        raise RuntimeError("Google Sheets integration is disabled (SHEETS_ENABLED=0)")
+        if self._gc is not None:
+            return self._gc
+        creds_raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+        if not creds_raw:
+            raise RuntimeError("GOOGLE_CREDENTIALS_JSON is empty")
+        try:
+            creds_info = json.loads(creds_raw)
+        except Exception as e:
+            raise RuntimeError(f"GOOGLE_CREDENTIALS_JSON is not valid JSON: {e}")
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        self._gc = gspread.authorize(creds)
+        return self._gc
+
+    def open_spreadsheet(self):
+        gc = self.get_client()
+        sid = Config.GSHEET_ID
+        if not sid:
+            raise RuntimeError("GSHEET_ID is not set")
+        try:
+            return gc.open_by_key(sid)
+        except Exception as e:
+            raise RuntimeError(f"Failed to open spreadsheet {sid}: {e}")
+
+    def get_worksheet(self):
+        if self._ws is not None:
+            return self._ws
+        sh = self.open_spreadsheet()
+        tab = Config.GSHEET_TAB or "Ads"
+        try:
+            self._ws = sh.worksheet(tab)
+            return self._ws
+        except Exception as e:
+            raise RuntimeError(f"Failed to open worksheet '{tab}': {e}")
+
+sheets_manager = SheetsManager()
+
+def open_spreadsheet():
+    return sheets_manager.open_spreadsheet()
+
+def get_worksheet():
+    return sheets_manager.get_worksheet()
+
 
 sheets_manager = SheetsManagerDisabled()
 
@@ -975,4 +1025,5 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
 
