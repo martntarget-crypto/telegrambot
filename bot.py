@@ -4,7 +4,7 @@
 # Требования окружения (Railway → Variables):
 #   API_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
 #   GOOGLE_CREDENTIALS_JSON={...весь JSON сервис-аккаунта...}
-#   GSHEET_ID=1yrB5Vy7o18B05nJkJBqQe9hE9971jlsTMEKKTsDHGa8w
+#   GSHEET_ID=1yrB5Vy7o18B05nkJBqQe9hE9971jJsTMEKKTsDHGa8w
 #   GSHEET_TAB=Ads
 #   SHEETS_ENABLED=1
 #   ADMIN_CHAT_ID=640007272   (опционально)
@@ -101,7 +101,6 @@ class SheetsManager:
 
     def get_rows(self) -> List[Dict[str, Any]]:
         ws = self.client.open_by_key(self.sheet_id).worksheet(self.tab_name)
-        # заголовки → словари
         rows = ws.get_all_records()
         logger.info(f"Loaded {len(rows)} rows from Sheets [{self.tab_name}]")
         return rows
@@ -185,10 +184,10 @@ def current_lang(uid: int) -> str:
 def main_menu(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(T["btn_fast"][lang])],
-            [KeyboardButton(T["btn_search"][lang]), KeyboardButton(T["btn_latest"][lang])],
-            [KeyboardButton(T["btn_favs"][lang])],
-            [KeyboardButton(T["btn_language"][lang]), KeyboardButton(T["btn_about"][lang])]
+            [KeyboardButton(text=T["btn_fast"][lang])],
+            [KeyboardButton(text=T["btn_search"][lang]), KeyboardButton(text=T["btn_latest"][lang])],
+            [KeyboardButton(text=T["btn_favs"][lang])],
+            [KeyboardButton(text=T["btn_language"][lang]), KeyboardButton(text=T["btn_about"][lang])]
         ],
         resize_keyboard=True
     )
@@ -311,19 +310,23 @@ def pick_ad(uid: int) -> Dict[str, Any]:
     pool = [a for a in ADS if a.get("id") != LAST_AD_ID.get(uid)] or ADS
     return random.choice(pool)
 
-async def maybe_show_ad(message: types.Message, uid: int):
-    if not should_show_ad(uid): return
+async def maybe_show_ad_by_chat(chat_id: int, uid: int):
+    if not should_show_ad(uid): 
+        return
     ad = pick_ad(uid)
     url = build_utm_url(ad.get("url",""), ad.get("id","ad"), uid)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👉 Подробнее", url=url)]
     ])
-    await message.answer(ad.get("text_ru","LivePlace"), reply_markup=kb)
+    try:
+        await bot.send_message(chat_id, ad.get("text_ru","LivePlace"), reply_markup=kb)
+    except Exception:
+        pass
     LAST_AD_TIME[uid] = time.time()
     LAST_AD_ID[uid] = ad.get("id")
 
 # == Поиск ==
-def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]] -> List[Dict[str, Any]]:
     def ok(r):
         if q.get("mode") and norm_mode(r.get("mode")) != q["mode"]: return False
         if q.get("city") and norm(r.get("city")) != norm(q["city"]): return False
@@ -396,7 +399,11 @@ async def start_search(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(Wizard.mode)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton("rent")],[KeyboardButton("sale")],[KeyboardButton("daily")]],
+        keyboard=[
+            [KeyboardButton(text="rent")],
+            [KeyboardButton(text="sale")],
+            [KeyboardButton(text="daily")]
+        ],
         resize_keyboard=True
     )
     await message.answer("Выберите режим: rent / sale / daily", reply_markup=kb)
@@ -410,7 +417,10 @@ async def pick_city(message: types.Message, state: FSMContext):
 
     rows = await rows_async()
     cities = sorted({str(r.get("city","")).strip() for r in rows if r.get("city")})
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(c)] for c in cities[:20]], resize_keyboard=True)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=c)] for c in cities[:20]],
+        resize_keyboard=True
+    )
     await state.set_state(Wizard.city)
     await message.answer("Выберите город:", reply_markup=kb)
 
@@ -419,7 +429,12 @@ async def pick_budget(message: types.Message, state: FSMContext):
     await state.update_data(city=message.text.strip())
     await state.set_state(Wizard.budget)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton("500")],[KeyboardButton("1000")],[KeyboardButton("2000")],[KeyboardButton("5000")]],
+        keyboard=[
+            [KeyboardButton(text="500")],
+            [KeyboardButton(text="1000")],
+            [KeyboardButton(text="2000")],
+            [KeyboardButton(text="5000")]
+        ],
         resize_keyboard=True
     )
     await message.answer("Максимальный бюджет (число):", reply_markup=kb)
@@ -478,9 +493,9 @@ async def send_page(chat_id: int, uid: int, page: int):
         ]
     ])
     await bot.send_message(chat_id, "Навигация:", reply_markup=nav)
+
     # возможно показать рекламу
-    dummy = types.Message(chat=types.Chat(id=chat_id, type="private"), message_id=0, date=datetime.now())
-    await maybe_show_ad(dummy, uid)
+    await maybe_show_ad_by_chat(chat_id, uid)
 
 @dp.callback_query(F.data.startswith("nav:"))
 async def cb_nav(cb: types.CallbackQuery):
