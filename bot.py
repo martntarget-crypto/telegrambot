@@ -1,33 +1,29 @@
-# LivePlace Telegram Bot — Railway-stable edition (Sheets disabled)
-# Полная версия файла bot.py без сокращений
-# Изменения:
-#  - Отключены реальные вызовы Google Sheets (без credentials.json)
-#  - Убрана блокирующая защита singleton (без fcntl/psutil)
-#  - Добавлен heartbeat в логи каждые 10 минут
-#  - Безопасные заглушки загрузки данных и статистики
+# -*- coding: utf-8 -*-
+# LivePlace Telegram Bot — Railway-ready (Sheets ENABLED)
+# Полная рабочая версия bot.py с реальным подключением к Google Sheets.
+# Требования окружения (Railway → Variables):
+#   API_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
+#   GOOGLE_CREDENTIALS_JSON={...весь JSON сервис-аккаунта...}
+#   GSHEET_ID=1yrB5Vy7o18B05nJkJBqQe9hE9971jlsTMEKKTsDHGa8w
+#   GSHEET_TAB=Ads
+#   SHEETS_ENABLED=1
+#   ADMIN_CHAT_ID=640007272   (опционально)
 
 import os
 import re
 import csv
+import json
+import time
+import random
 import asyncio
 import logging
-print("RAILWAY ENV DEBUG:", {
-    "SHEETS_ENABLED": os.getenv("SHEETS_ENABLED"),
-    "GSHEET_ID": os.getenv("GSHEET_ID"),
-    "GSHEET_TAB": os.getenv("GSHEET_TAB"),
-    "HAS_CREDENTIALS": bool(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-})
-import random
-import time
-import json
-import sys
-from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from time import monotonic
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter, defaultdict
+from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 
-# ---- Aiogram 3.x Imports ----
+# == Aiogram 3.x ==
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -35,177 +31,105 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
+    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 )
 
-# ---- Configuration and Logging ----
+# == Logging ==
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("liveplace")
+
+# == .env (локально не требуется, но не мешает) ==
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("liveplace")
-
-# ---- Non-blocking Singleton (Railway-friendly) ----
-def ensure_singleton():
-    """
-    Railway-friendly singleton: не блокирует второй процесс,
-    просто пишет инфо-лог. (Полное блокирование отключено.)
-    """
-    try:
-        logger.info("Singleton check (non-blocking) enabled")
-    except Exception:
-        pass
-    return None
-
-_singleton_lock = ensure_singleton()
-
-# ---- Environment Variables ----
+# == Config ==
 class Config:
-    API_TOKEN = os.getenv("API_TOKEN", "").strip() or "CHANGE_ME_TOKEN"
+    API_TOKEN = os.getenv("API_TOKEN", "").strip()
     ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
 
-    # Sheets отключены по умолчанию, включим позже
-    SHEETS_ENABLED = os.getenv("SHEETS_ENABLED", "0").strip() not in {"", "0", "false", "False"}
+    SHEETS_ENABLED = os.getenv("SHEETS_ENABLED", "1").strip() not in {"", "0", "false", "False"}
     GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
     GSHEET_TAB = os.getenv("GSHEET_TAB", "Ads").strip()
-    GSHEET_REFRESH_MIN = int(os.getenv("GSHEET_REFRESH_MIN", "2"))
+    GSHEET_REFRESH_MIN = int(os.getenv("GSHEET_REFRESH_MIN", "2") or "2")
 
-    # Для будущего включения статистик
-    GSHEET_STATS_ID = os.getenv("GSHEET_STATS_ID", "").strip()
-    WEEKLY_REPORT_DOW = int(os.getenv("WEEKLY_REPORT_DOW", "1") or "1")
-    WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "9") or "9")
-
-    # UTM / рекламы
+    # Рекламные UTM
     UTM_SOURCE = os.getenv("UTM_SOURCE", "telegram")
     UTM_MEDIUM = os.getenv("UTM_MEDIUM", "bot")
     UTM_CAMPAIGN = os.getenv("UTM_CAMPAIGN", "bot_ads")
 
-    ADS_ENABLED = os.getenv("ADS_ENABLED", "1").strip() not in {"0", "false", "False", ""}
+    # Реклама/частота
+    ADS_ENABLED = os.getenv("ADS_ENABLED", "1") not in {"0", "false", "False", ""}
     ADS_PROB = float(os.getenv("ADS_PROB", "0.18"))
     ADS_COOLDOWN_SEC = int(os.getenv("ADS_COOLDOWN_SEC", "180"))
 
-if not Config.API_TOKEN or Config.API_TOKEN == "CHANGE_ME_TOKEN":
-    logger.warning("API_TOKEN is not set. Please set API_TOKEN in Railway Variables.")
+if not Config.API_TOKEN:
+    raise RuntimeError("API_TOKEN is not set. Add it to Railway Variables.")
 
-# ---- Admin Management ----
-ADMINS_RAW = os.getenv("ADMINS", "").strip()
-ADMINS_SET = set(int(x) for x in ADMINS_RAW.split(",") if x.strip().isdigit())
-if Config.ADMIN_CHAT_ID:
-    ADMINS_SET.add(Config.ADMIN_CHAT_ID)
+# == Bot ==
+bot = Bot(token=Config.API_TOKEN, parse_mode="HTML")
+dp = Dispatcher(storage=MemoryStorage())
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS_SET
-
-# ---- Stable Bot Implementation ----
-class StableBot(Bot):
-    async def get_updates(self, *args, **kwargs):
-        try:
-            return await super().get_updates(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Get updates error: {e}")
-            await asyncio.sleep(10)
-            return []
-
-# Initialize bot and dispatcher for Aiogram 3.x
-bot = StableBot(token=Config.API_TOKEN, parse_mode="HTML")
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-
-# ---------------------------------------------------------------------
-#  Google Sheets subsystem — ENABLED via GOOGLE_CREDENTIALS_JSON
-# ---------------------------------------------------------------------
+# == Google Sheets ==
 import gspread
 from google.oauth2.service_account import Credentials
 
 class SheetsManager:
     def __init__(self):
+        if not Config.SHEETS_ENABLED:
+            raise RuntimeError("SHEETS_ENABLED must be 1 for SheetsManager")
+
         creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
         if not creds_json:
-            raise RuntimeError("Missing GOOGLE_CREDENTIALS_JSON")
+            raise RuntimeError("GOOGLE_CREDENTIALS_JSON is missing in Variables")
 
-        creds = Credentials.from_service_account_info(json.loads(creds_json),
-                                                      scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        creds = Credentials.from_service_account_info(
+            json.loads(creds_json),
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets.readonly",
+                "https://www.googleapis.com/auth/drive.readonly",
+            ],
+        )
         self.client = gspread.authorize(creds)
-        self.sheet_id = os.getenv("GSHEET_ID")
-        self.tab_name = os.getenv("GSHEET_TAB", "Ads")
+        self.sheet_id = Config.GSHEET_ID
+        self.tab_name = Config.GSHEET_TAB or "Ads"
 
-    def get_rows(self):
-        sheet = self.client.open_by_key(self.sheet_id).worksheet(self.tab_name)
-        return sheet.get_all_records()
+    def get_rows(self) -> List[Dict[str, Any]]:
+        ws = self.client.open_by_key(self.sheet_id).worksheet(self.tab_name)
+        # заголовки → словари
+        rows = ws.get_all_records()
+        logger.info(f"Loaded {len(rows)} rows from Sheets [{self.tab_name}]")
+        return rows
 
-sheets_manager = SheetsManager()
-logger.info("Starting LivePlace bot (Sheets enabled, Railway-stable)...")
+sheets = SheetsManager()
 
-# ---- Data Management with Graceful Degradation ----
-REQUIRED_COLUMNS = {
-    "mode","city","district","type","rooms","price","published",
-    "title_ru","title_en","title_ka","description_ru","description_en","description_ka",
-    "phone","photo1","photo2","photo3","photo4","photo5","photo6","photo7","photo8","photo9","photo10"
-}
-
+# == Кэш объявлений ==
 _cached_rows: List[Dict[str, Any]] = []
-_cache_loaded_at: float = 0.0
-_cache_error_count: int = 0
-_MAX_CACHE_ERRORS = 3
-_LAST_SUCCESSFUL_LOAD: float = 0.0
-
-def _is_cache_stale() -> bool:
-    if not _cached_rows:
-        return True
-    ttl = max(1, Config.GSHEET_REFRESH_MIN) * 60
-    return (monotonic() - _cache_loaded_at) >= ttl
+_cache_ts: float = 0.0
+CACHE_TTL = max(1, Config.GSHEET_REFRESH_MIN) * 60
 
 def load_rows(force: bool = False) -> List[Dict[str, Any]]:
-    """
-    В режиме без Sheets всегда возвращаем кеш (если был) или пустой список.
-    Никогда не падаем.
-    """
-    global _cached_rows, _cache_loaded_at, _cache_error_count, _LAST_SUCCESSFUL_LOAD
-
-    # Sheets отключены — безопасно выходим
-    if not Config.SHEETS_ENABLED:
-        if not _cached_rows:
-            logger.info("Sheets disabled: returning empty dataset")
-        else:
-            logger.info("Sheets disabled: returning cached dataset")
-        return _cached_rows or []
-
-    # (Если когда-то включим SHEETS_ENABLED=1 — ниже будет рабочий код;
-    # сейчас его не выполняем)
+    global _cached_rows, _cache_ts
+    if not force and _cached_rows and (monotonic() - _cache_ts) < CACHE_TTL:
+        return _cached_rows
     try:
-        ws = get_worksheet()  # при disabled бросает исключение — но мы сюда не зайдём
-        header = [h.strip() for h in ws.row_values(1)]
-        missing = sorted(list(REQUIRED_COLUMNS - set(header)))
-        if missing:
-            logger.warning(f"Missing columns in sheet: {missing}")
-        rows = ws.get_all_records()
-        _cached_rows = rows
-        _cache_loaded_at = monotonic()
-        _LAST_SUCCESSFUL_LOAD = _cache_loaded_at
-        _cache_error_count = 0
-        logger.info(f"Successfully loaded {len(rows)} rows from Google Sheets")
-        return rows
+        data = sheets.get_rows()
+        _cached_rows = data
+        _cache_ts = monotonic()
+        return data
     except Exception as e:
-        _cache_error_count += 1
-        logger.error(f"Failed to load rows (attempt {_cache_error_count}/{_MAX_CACHE_ERRORS}): {e}")
-        if _cached_rows:
-            logger.warning("Using cached data due to loading error")
-            return _cached_rows
-        else:
-            # Жёсткий безопасный fallback: не запаникуем, отдадим пусто
-            logger.error("No cached data available, returning empty list")
-            return []
+        logger.error(f"Failed to load rows from Sheets: {e}")
+        return _cached_rows or []
 
 async def rows_async(force: bool = False) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(load_rows, force)
 
-# ---- Internationalization ----
+# == Локализация и тексты ==
 LANGS = ["ru", "en", "ka"]
 USER_LANG: Dict[int, str] = {}
 LANG_MAP = {"ru":"ru","ru-RU":"ru","en":"en","en-US":"en","en-GB":"en","ka":"ka","ka-GE":"ka"}
@@ -222,19 +146,16 @@ T = {
     "btn_daily": {"ru": "🕓 Посуточно 🆕", "en": "🕓 Daily rent 🆕", "ka": "🕓 დღიურად 🆕"},
     "btn_rent": {"ru": "🏘 Аренда", "en": "🏘 Rent", "ka": "🏘 ქირავდება"},
     "btn_sale": {"ru": "🏠 Продажа", "en": "🏠 Sale", "ka": "🏠 იყიდება"},
-    "btn_skip": {"ru": "Пропустить", "en": "Skip", "ka": "გამოტოვება"},
-    "btn_more": {"ru": "Ещё…", "en": "More…", "ka": "კიდევ…"},
     "btn_prev": {"ru": "« Назад", "en": "« Prev", "ka": "« უკან"},
     "btn_next": {"ru": "Вперёд »", "en": "Next »", "ka": "წინ »"},
     "btn_like": {"ru": "❤️ Нравится", "en": "❤️ Like", "ka": "❤️ მომეწონა"},
     "btn_dislike": {"ru": "👎 Дизлайк", "en": "👎 Dislike", "ka": "👎 არ მომწონს"},
     "btn_fav_add": {"ru": "⭐ В избранное", "en": "⭐ Favorite", "ka": "⭐ რჩეულებში"},
     "btn_fav_del": {"ru": "⭐ Удалить из избранного", "en": "⭐ Remove favorite", "ka": "⭐ წაშლა"},
-    "btn_share": {"ru": "🔗 Поделиться", "en": "🔗 Share", "ka": "🔗 გაზიარება"},
 
     "start": {
         "ru": "<b>LivePlace</b>\n👋 Привет! Я помогу подобрать <b>идеальную недвижимость в Грузии</b>.\n\n<b>Как это работает?</b>\n— Задам 3–4 простых вопроса\n— Покажу лучшие варианты с фото и телефоном владельца\n— Просто посмотреть? Жми <b>🟢 Быстрый подбор</b>\n\nДобро пожаловать и удачного поиска! 🏡",
-        "en": "<b>LivePlace</b>\n👋 Hi! I'll help you find <b>your ideal home in Georgia</b>.\n\n<b>How it works:</b>\n— I ask 3–4 quick questions\n— Show top options with photos and owner phone\n— Just browsing? Tap <b>🟢 Quick picks</b>\n\nWelcome and happy hunting! 🏡",
+        "en": "<b>LivePlace</b>\n👋 Hi! I'll help you find <b>your ideal home in Georgia</b>.\n\n<b>How it works:</b>\n— 3–4 quick questions\n— Top options with photos & owner phone\n— Just browsing? Tap <b>🟢 Quick picks</b>\n\nWelcome and happy hunting! 🏡",
         "ka": "<b>LivePlace</b>\n👋 გამარჯობა! ერთად ვიპოვოთ <b>იდეალური ბინა საქართველოში</b>.\n\n<b>როგორ მუშაობს:</b>\n— 3–4 მარტივი კითხვა\n— საუკეთესო ვარიანტები ფოტოებითა და მფლობელის ნომრით\n— უბრალოდ გადაათვალიერე? დააჭირე <b>🟢 სწრაფი არჩევანი</b>\n\nკეთილი იყოს თქვენი მობრძანება! 🏡",
     },
     "about": {
@@ -242,26 +163,6 @@ T = {
         "en": "LivePlace: fast real-estate search in Georgia. Filters, 10 photos, owner phone, favorites.",
         "ka": "LivePlace: უძრავი ქონების სწრაფი ძიება საქართველოში. ფილტრები, 10 ფოტო, მფლობელის ნომერი, რჩეულები."
     },
-    "choose_lang": {"ru": "Выберите язык:", "en": "Choose language:", "ka": "აირჩიე ენა:"},
-    "wiz_intro": {"ru": "Выберите режим работы:", "en": "Choose mode:", "ka": "აირჩიეთ რეჟიმი:"},
-    "ask_city": {"ru": "🏙 Выберите город:", "en": "🏙 Choose city:", "ka": "🏙 აირჩიეთ ქალაქი:"},
-    "ask_district": {"ru": "📍 Выберите район:", "en": "📍 Choose district:", "ka": "📍 აირჩიეთ რაიონი:"},
-    "ask_type": {"ru": "🏡 Выберите тип недвижимости:", "en": "🏡 Choose property type:", "ka": "🏡 აირჩიეთ ტიპი:"},
-    "ask_rooms": {"ru": "🚪 Количество комнат:", "en": "🚪 Rooms:", "ka": "🚪 ოთახების რაოდენობა:"},
-    "ask_price": {"ru": "💵 Бюджет:", "en": "💵 Budget:", "ka": "💵 ბიუჯეტი:"},
-    "no_results": {"ru": "Ничего не найдено.", "en": "No results.", "ka": "ვერაფერი მოიძებნა."},
-    "results_found": {"ru": "Найдено объявлений: <b>{n}</b>", "en": "Listings found: <b>{n}</b>", "ka": "მოიძებნა განცხადება: <b>{n}</b>"},
-    "lead_ask": {"ru": "Оставьте контакт (телефон или @username), и мы свяжем вас с владельцем:", "en": "Leave your contact (phone or @username), we'll connect you with the owner:", "ka": "მოგვაწოდეთ კონტაქტი (ტელეფონი ან @username), დაგაკავშირდებით მფლობელთან:"},
-    "lead_ok": {"ru": "Спасибо! Передали менеджеру.", "en": "Thanks! Sent to manager.", "ka": "მადლობა! გადაგზავნილია მენეჯერთან."},
-    "label_price": {"ru":"Цена", "en":"Price", "ka":"ფასი"},
-    "label_pub": {"ru":"Опубликовано", "en":"Published", "ka":"გამოქვეყნდა"},
-    "label_phone": {"ru":"Телефон", "en":"Phone", "ka":"ტელეფონი"},
-    "toast_removed": {"ru":"Удалено", "en":"Removed", "ka":"წაშლილია"},
-    "toast_saved": {"ru":"Сохранено в избранное", "en":"Saved to favorites", "ka":"რჩეულებში შენახულია"},
-    "toast_next": {"ru":"Следующее", "en":"Next", "ka":"შემდეგი"},
-    "toast_no_more": {"ru":"Больше объявлений нет", "en":"No more listings", "ka":"სხვა განცხადება აღარ არის"},
-    "lead_invalid": {"ru":"Оставьте телефон (+995...) или @username.", "en":"Please leave a phone (+995...) or @username.", "ka":"გთხოვთ მიუთითოთ ტელეფონი (+995...) ან @username."},
-    "lead_too_soon": {"ru":"Чуть позже, заявка уже отправлена.", "en":"Please wait, your request was just sent.", "ka":"გთხოვთ მოიცადოთ, თქვენი განაცხადი უკვე გაიგზავნა."},
 }
 
 LANG_FIELDS = {
@@ -270,35 +171,16 @@ LANG_FIELDS = {
     "ka": {"title": "title_ka", "desc": "description_ka"},
 }
 
-def t(lang: str, key: str, **kwargs) -> str:
+def t(lang: str, key: str, **kw) -> str:
     lang = lang if lang in LANGS else "ru"
     val = T.get(key, {}).get(lang, T.get(key, {}).get("ru", key))
-    if kwargs:
-        try:
-            return val.format(**kwargs)
-        except Exception:
-            return val
-    return val
+    try:
+        return val.format(**kw) if kw else val
+    except Exception:
+        return val
 
-def current_lang_for(uid: int) -> str:
-    return USER_LANG.get(uid, "ru") if uid in USER_LANG else "ru"
-
-def cta_text(lang: str) -> str:
-    return {"ru":"👉 Подробнее","en":"👉 Learn more","ka":"👉 დაწვრილებით"}.get(lang, "👉 Подробнее")
-
-def build_utm_url(raw: str, ad_id: str, uid: int) -> str:
-    if not raw:
-        return "https://liveplace.com.ge/"
-    seed = f"{uid}:{datetime.utcnow().strftime('%Y%m%d')}:{ad_id}".encode("utf-8")
-    token = __import__("hashlib").sha256(seed).hexdigest()[:16]
-    u = urlparse(raw); q = parse_qs(u.query)
-    q["utm_source"] = [Config.UTM_SOURCE]
-    q["utm_medium"] = [Config.UTM_MEDIUM]
-    q["utm_campaign"] = [Config.UTM_CAMPAIGN]
-    q["utm_content"] = [ad_id]
-    q["token"] = [token]
-    new_q = urlencode({k: v[0] for k, v in q.items()})
-    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+def current_lang(uid: int) -> str:
+    return USER_LANG.get(uid, "ru")
 
 def main_menu(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -311,73 +193,71 @@ def main_menu(lang: str) -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-# ---- Utilities ----
-def norm(s: str) -> str:
-    return (s or "").strip().lower()
+# == Утилиты ==
+def norm(s: Any) -> str:
+    return str(s or "").strip().lower()
 
-def norm_mode(v: str) -> str:
+def norm_mode(v: Any) -> str:
     s = norm(v)
-    if s in {"rent","аренда","long","long-term","долгосрочно","longterm"}:
-        return "rent"
-    if s in {"sale","продажа","buy","sell"}:
-        return "sale"
-    if s in {"daily","посуточно","sutki","сутки","short","short-term","shortterm","day","day-to-day"}:
-        return "daily"
+    if s in {"rent","аренда","long","long-term","долгосрочно","longterm"}: return "rent"
+    if s in {"sale","продажа","buy","sell"}: return "sale"
+    if s in {"daily","посуточно","sutki","сутки","short","short-term","day"}: return "daily"
     return ""
 
 def drive_direct(url: str) -> str:
-    if not url:
-        return url
+    if not url: return url
     m = re.search(r"/d/([A-Za-z0-9_-]{20,})/", url)
-    if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    if m: return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
     m = re.search(r"[?&]id=([A-Za-z0-9_-]{20,})", url)
-    if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    if m: return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
     return url
 
 def looks_like_image(url: str) -> bool:
-    u = (url or "").strip().lower()
-    if not u:
-        return False
-    if any(u.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
-        return True
-    if "google.com/uc?export=download" in u or "googleusercontent.com" in u:
-        return True
-    return False
+    if not url: return False
+    u = url.lower()
+    return any(u.endswith(ext) for ext in (".jpg",".jpeg",".png",".webp")) or \
+           "googleusercontent.com" in u or "google.com/uc?export=download" in u
 
 def collect_photos(row: Dict[str, Any]) -> List[str]:
-    photos = []
-    for i in range(1, 10+1):
-        url = str(row.get(f"photo{i}", "")).strip()
-        if not url:
-            continue
-        url = drive_direct(url)
-        if looks_like_image(url):
-            photos.append(url)
-    return photos
+    out = []
+    for i in range(1, 11):
+        u = str(row.get(f"photo{i}", "")).strip()
+        if not u: continue
+        u = drive_direct(u)
+        if looks_like_image(u): out.append(u)
+    return out
 
 def parse_rooms(v: Any) -> float:
     s = str(v or "").strip().lower()
-    if s in {"студия","studio","stud","სტუდიო"}:
-        return 0.5
-    try:
-        return float(s.replace("+", ""))
-    except Exception:
-        return -1.0
+    if s in {"студия","studio","stud","სტუდიო"}: return 0.5
+    try: return float(s.replace("+",""))
+    except Exception: return -1.0
+
+def build_utm_url(raw: str, ad_id: str, uid: int) -> str:
+    if not raw: return "https://liveplace.com.ge/"
+    seed = f"{uid}:{datetime.utcnow().strftime('%Y%m%d')}:{ad_id}".encode()
+    token = __import__("hashlib").sha256(seed).hexdigest()[:16]
+    u = urlparse(raw); q = parse_qs(u.query)
+    q["utm_source"]=[Config.UTM_SOURCE]
+    q["utm_medium"]=[Config.UTM_MEDIUM]
+    q["utm_campaign"]=[Config.UTM_CAMPAIGN]
+    q["utm_content"]=[ad_id]
+    q["token"]=[token]
+    new_q = urlencode({k: v[0] for k,v in q.items()})
+    return urlunparse((u.scheme,u.netloc,u.path,u.params,new_q,u.fragment))
 
 def format_card(row: Dict[str, Any], lang: str) -> str:
     title_k = LANG_FIELDS[lang]["title"]
-    desc_k = LANG_FIELDS[lang]["desc"]
-    city = str(row.get("city", "")).strip()
-    district = str(row.get("district", "")).strip()
-    rtype = str(row.get("type", "")).strip()
-    rooms = str(row.get("rooms", "")).strip()
-    price = str(row.get("price", "")).strip()
-    published = str(row.get("published", "")).strip()
-    phone = str(row.get("phone", "")).strip()
-    title = str(row.get(title_k, "")).strip()
-    desc = str(row.get(desc_k, "")).strip()
+    desc_k  = LANG_FIELDS[lang]["desc"]
+    city     = str(row.get("city","")).strip()
+    district = str(row.get("district","")).strip()
+    rtype    = str(row.get("type","")).strip()
+    rooms    = str(row.get("rooms","")).strip()
+    price    = str(row.get("price","")).strip()
+    published= str(row.get("published","")).strip()
+    phone    = str(row.get("phone","")).strip()
+    title    = str(row.get(title_k,"")).strip()
+    desc     = str(row.get(desc_k,"")).strip()
 
     pub_txt = published
     try:
@@ -387,135 +267,17 @@ def format_card(row: Dict[str, Any], lang: str) -> str:
         pass
 
     lines = []
-    if title:
-        lines.append(f"<b>{title}</b>")
-    info_line = f"{rtype} • {rooms} • {city}, {district}".strip(" •,")
-    if info_line:
-        lines.append(info_line)
-    if price:
-        lines.append(f"{t(lang,'label_price')}: {price}")
-    if pub_txt:
-        lines.append(f"{t(lang,'label_pub')}: {pub_txt}")
-    if desc:
-        lines.append(desc)
-    if phone:
-        lines.append(f"<b>{t(lang,'label_phone')}:</b> {phone}")
-    if not desc and not phone:
-        lines.append("—")
+    if title: lines.append(f"<b>{title}</b>")
+    info_line = " • ".join([x for x in [rtype or "", rooms or "", f"{city}, {district}".strip(", ")] if x])
+    if info_line: lines.append(info_line)
+    if price: lines.append(f"Цена: {price}")
+    if pub_txt: lines.append(f"Опубликовано: {pub_txt}")
+    if desc: lines.append(desc)
+    if phone: lines.append(f"<b>Телефон:</b> {phone}")
+    if not desc and not phone: lines.append("—")
     return "\n".join(lines)
 
-# ---- User Data Management ----
-PAGE_SIZE = 8
-CHOICE_CACHE: Dict[int, Dict[str, List[Tuple[str, str]]]] = {}
-CHOICE_MSG: Dict[int, Dict[str, int]] = {}
-USER_RESULTS: Dict[int, Dict[str, Any]] = {}
-USER_FAVS: Dict[int, List[str]] = {}
-LEAD_COOLDOWN = 45
-LAST_LEAD_AT: Dict[int, float] = {}
-LAST_AD_ID: Dict[int, str] = {}
-LAST_AD_TIME: Dict[int, float] = {}
-
-# ---- Localization for Choices ----
-def _l10n_label(row: Dict[str, Any], field: str, lang: str) -> str:
-    base = str(row.get(field, "")).strip()
-    if field not in ("city", "district"):
-        return base
-    if lang == "ru":
-        return base or ""
-    alt = str(row.get(f"{field}_{lang}", "")).strip()
-    return alt or base
-
-def unique_values_l10n(rows: List[Dict[str, Any]], field: str, lang: str,
-                       where: Optional[List[Tuple[str, str]]] = None) -> List[Tuple[str, str]]:
-    out: List[Tuple[str,str]] = []
-    seen: set = set()
-    for r in rows:
-        ok = True
-        if where:
-            for f, val in where:
-                if norm(r.get(f)) != norm(val):
-                    ok = False
-                    break
-        if not ok:
-            continue
-        base = str(r.get(field, "")).strip()
-        if not base or base in seen:
-            continue
-        label = _l10n_label(r, field, lang)
-        seen.add(base)
-        out.append((label, base))
-    out.sort(key=lambda x: x[0])
-    return out
-
-# ---- Advertising System ----
-ADS = [
-    {"id":"lead_form","text_ru":"🔥 Ищете квартиру быстрее? Оставьте заявку на сайте — подберём за 24 часа!",
-     "text_en":"🔥 Need a place fast? Leave a request on our website — we'll find options within 24h!",
-     "text_ka":"🔥 ბინა გჭირდებათ სწრაფად? დატოვეთ განაცხადი საიტზე — 24 საათში მოვძებნით ვარიანტებს!",
-     "url":"https://liveplace.com.ge/lead","photo":""},
-    {"id":"mortgage_help","text_ru":"🏦 Поможем с ипотекой для нерезидентов в Грузии. Узнайте детали на сайте.",
-     "text_en":"🏦 Mortgage support for non-residents in Georgia. Learn more on our website.",
-     "text_ka":"🏦 იპოთეკა არარეზიდენტებისთვის საქართველოში — დეტალები საიტზე.",
-     "url":"https://liveplace.com.ge/mortgage","photo":""},
-    {"id":"rent_catalog","text_ru":"🏘 Посмотрите новые квартиры в аренду — актуальные предложения на сайте.",
-     "text_en":"🏘 Explore new rentals — fresh listings on our website.",
-     "text_ka":"🏘 ნახეთ გაქირავების ახალი ბინები — განახლებული განცხადებები საიტზე.",
-     "url":"https://liveplace.com.ge/rent","photo":""},
-    {"id":"sell_service","text_ru":"💼 Хотите продать квартиру? Оценим и разместим ваше объявление на LivePlace.",
-     "text_en":"💼 Selling your property? We'll valuate and list it on LivePlace.",
-     "text_ka":"💼 ყიდით ბინას? შევაფასებთ და დავდებთ LivePlace-ზე.",
-     "url":"https://liveplace.com.ge/sell","photo":""},
-]
-
-def should_show_ad(uid: int) -> bool:
-    if not Config.ADS_ENABLED or not ADS:
-        return False
-    now = time.time()
-    last = LAST_AD_TIME.get(uid, 0.0)
-    if now - last < Config.ADS_COOLDOWN_SEC:
-        return False
-    return random.random() < Config.ADS_PROB
-
-def pick_ad(uid: int, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    mode = context.get("mode", "")
-    pool = ADS
-    if mode == "sale":
-        pool = [a for a in ADS if a["id"] in {"mortgage_help", "sell_service"}] or ADS
-    last_id = LAST_AD_ID.get(uid)
-    cand = [a for a in pool if a.get("id") != last_id] or pool
-    return random.choice(cand) if cand else None
-
-async def maybe_show_ad(message_or_cb, uid: int, context: Dict[str, Any]):
-    try:
-        if not should_show_ad(uid):
-            return
-        ad = pick_ad(uid, context) or random.choice(ADS)
-        lang = current_lang_for(uid)
-
-        txt = ad.get(f"text_{lang}") or ad.get("text_ru") or "LivePlace"
-        url = build_utm_url(ad.get("url"), ad.get("id", "ad"), uid)
-        btn = InlineKeyboardMarkup().add(InlineKeyboardButton(cta_text(lang), url=url))
-
-        target = message_or_cb.message if isinstance(message_or_cb, types.CallbackQuery) else message_or_cb
-
-        if ad.get("photo"):
-            try:
-                await target.answer_photo(ad["photo"], caption=txt, reply_markup=btn)
-            except Exception:
-                await target.answer(txt, reply_markup=btn)
-        else:
-            await target.answer(txt, reply_markup=btn)
-
-        LAST_AD_TIME[uid] = time.time()
-        LAST_AD_ID[uid] = ad.get("id")
-        try:
-            log_event("ad_show", uid, row=None, extra={"ad_id": ad.get("id", "unknown")})
-        except Exception:
-            pass
-    except Exception as e:
-        logger.warning(f"maybe_show_ad failed: {e}")
-
-# ---- Search States ----
+# == Пользовательские состояния ==
 class Search(StatesGroup):
     mode = State()
     city = State()
@@ -524,471 +286,268 @@ class Search(StatesGroup):
     rooms = State()
     price = State()
 
-# ---- Analytics System ----
-def _today_str():
-    return datetime.utcnow().strftime("%Y-%m-%d")
+# == Данные пользователя/результаты ==
+PAGE_SIZE = 8
+USER_RESULTS: Dict[int, Dict[str, Any]] = {}
+USER_FAVS: Dict[int, List[str]] = {}
+LAST_AD_TIME: Dict[int, float] = {}
+LAST_AD_ID: Dict[int, str] = {}
 
-ANALYTIC_EVENTS: List[Dict[str, Any]] = []
-AGG_BY_DAY = defaultdict(lambda: Counter())
-AGG_BY_MODE = defaultdict(lambda: Counter())
-AGG_CITY = defaultdict(lambda: Counter())
-AGG_DISTRICT = defaultdict(lambda: Counter())
-AGG_FUNNEL = defaultdict(lambda: Counter())
-TOP_LISTINGS = defaultdict(lambda: Counter())
-TOP_LIKES = defaultdict(lambda: Counter())
-TOP_FAVS = defaultdict(lambda: Counter())
+# == Реклама ==
+ADS = [
+    {"id":"lead_form","text_ru":"🔥 Ищете квартиру быстрее? Оставьте заявку — подберём за 24 часа!","url":"https://liveplace.com.ge/lead","photo":""},
+    {"id":"mortgage_help","text_ru":"🏦 Поможем с ипотекой для нерезидентов. Узнайте детали.","url":"https://liveplace.com.ge/mortgage","photo":""},
+    {"id":"rent_catalog","text_ru":"🏘 Посмотрите новые квартиры в аренду — свежие объявления.","url":"https://liveplace.com.ge/rent","photo":""},
+    {"id":"sell_service","text_ru":"💼 Хотите продать квартиру? Разместим и продвинем на LivePlace.","url":"https://liveplace.com.ge/sell","photo":""},
+]
 
-ANALYTICS_SNAPSHOT = "analytics_snapshot.json"
-SNAPSHOT_INTERVAL_SEC = 300
+def should_show_ad(uid: int) -> bool:
+    if not Config.ADS_ENABLED or not ADS: return False
+    now = time.time()
+    if now - LAST_AD_TIME.get(uid,0.0) < Config.ADS_COOLDOWN_SEC: return False
+    return random.random() < Config.ADS_PROB
 
-def make_row_key(r: Dict[str,Any]) -> str:
-    payload = "|".join([
-        str(r.get("city","")), str(r.get("district","")),
-        str(r.get("type","")), str(r.get("rooms","")),
-        str(r.get("price","")), str(r.get("phone","")),
-        str(r.get("title_ru") or r.get("title_en") or r.get("title_ka") or "")
+def pick_ad(uid: int) -> Dict[str, Any]:
+    pool = [a for a in ADS if a.get("id") != LAST_AD_ID.get(uid)] or ADS
+    return random.choice(pool)
+
+async def maybe_show_ad(message: types.Message, uid: int):
+    if not should_show_ad(uid): return
+    ad = pick_ad(uid)
+    url = build_utm_url(ad.get("url",""), ad.get("id","ad"), uid)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👉 Подробнее", url=url)]
     ])
-    return __import__("hashlib").md5(payload.encode("utf-8")).hexdigest()
+    await message.answer(ad.get("text_ru","LivePlace"), reply_markup=kb)
+    LAST_AD_TIME[uid] = time.time()
+    LAST_AD_ID[uid] = ad.get("id")
 
-def _row_info(row: Dict[str, Any]) -> Dict[str, Any]:
-    def _floatprice(v):
-        try:
-            return float(v)
-        except Exception:
-            return 0.0
-    return {
-        "mode": norm_mode(row.get("mode","")),
-        "city": str(row.get("city","")).strip(),
-        "district": str(row.get("district","")).strip(),
-        "price": _floatprice(row.get("price")),
-        "rooms": str(row.get("rooms","")).strip(),
-        "key": make_row_key(row),
-        "title": str(row.get("title_ru") or row.get("title_en") or row.get("title_ka") or "").strip(),
-    }
+# == Поиск ==
+def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def ok(r):
+        if q.get("mode") and norm_mode(r.get("mode")) != q["mode"]: return False
+        if q.get("city") and norm(r.get("city")) != norm(q["city"]): return False
+        if q.get("district") and norm(r.get("district")) != norm(q["district"]): return False
+        if q.get("rtype") and norm(r.get("type")) != norm(q["rtype"]): return False
+        if q.get("rooms"):
+            try:
+                need = float(q["rooms"])
+                have = parse_rooms(r.get("rooms"))
+                if have < 0: return False
+                if int(need) != int(have) and not (need==0.5 and have==0.5):
+                    return False
+            except Exception:
+                return False
+        if q.get("price"):
+            try:
+                p = float(re.sub(r"[^\d.]", "", str(r.get("price","")) or "0"))
+                return p <= float(q["price"])
+            except Exception:
+                return False
+        return True
+    out = [r for r in rows if ok(r)]
+    return out
 
-def log_event(event: str, uid: int, row: Dict[str,Any]=None, extra: Dict[str,Any]=None):
-    ts = datetime.utcnow().isoformat(timespec="seconds")
-    day = _today_str()
-    payload = {"ts": ts, "day": day, "event": event, "uid": uid}
-    info = {}
-    if row:
-        info = _row_info(row)
-        payload.update(info)
-    if extra:
-        payload.update(extra)
+def _slice(listing: List[Any], page: int, size: int) -> List[Any]:
+    return listing[page*size:(page+1)*size]
 
-    ANALYTIC_EVENTS.append(payload)
-
-    AGG_BY_DAY[day][event] += 1
-    if info.get("mode"):
-        AGG_BY_MODE[day][f"{info['mode']}_{event}"] += 1
-    if info.get("city") and event in ("view","like","lead"):
-        AGG_CITY[day][info["city"]] += 1
-    if info.get("district") and event in ("view","like","lead"):
-        AGG_DISTRICT[day][info["district"]] += 1
-    if event in ("search","view","like","lead"):
-        AGG_FUNNEL[day][event] += 1
-    if info.get("key"):
-        if event == "view":
-            TOP_LISTINGS[day][info["key"]] += 1
-        if event == "like":
-            TOP_LIKES[day][info["key"]] += 1
-        if event == "fav_add":
-            TOP_FAVS[day][info["key"]] += 1
-
-def render_stats(day: str=None) -> str:
-    day = day or _today_str()
-    total = AGG_BY_DAY[day]
-    mode = AGG_BY_MODE[day]
-    city = AGG_CITY[day].most_common(5)
-    dist = AGG_DISTRICT[day].most_common(5)
-    fun = AGG_FUNNEL[day]
-    top_v = TOP_LISTINGS[day].most_common(3)
-    top_l = TOP_LIKES[day].most_common(3)
-    top_f = TOP_FAVS[day].most_common(3)
-
-    def pct(a,b): return f"{(a/b*100):.1f}%" if b else "0.0%"
-    conv_like = pct(fun["like"], max(fun["view"],1))
-    conv_lead = pct(fun["lead"], max(fun["view"],1))
-
-    lines = []
-    lines.append(f"📊 <b>Статистика за {day}</b>")
-    lines.append(f"Реклама показов: {total['ad_show']}")
-    lines.append(f"Всего: просмотров {total['view']}, лайков {total['like']}, дизлайков {total['dislike']}, заявок {total['lead']}, избранное +{total['fav_add']}/-{total['fav_remove']}")
-    lines.append(f"Воронка: search {fun['search']} → view {fun['view']} → like {fun['like']} ({conv_like}) → lead {fun['lead']} ({conv_lead})\n")
-    lines.append("По режимам:")
-    for m in ("rent","daily","sale"):
-        lines.append(f"  • {m}: view {mode[f'{m}_view']}, like {mode[f'{m}_like']}, lead {mode[f'{m}_lead']}")
-
-    if city:
-        lines.append("\nТоп городов: " + ", ".join([f"{c} {n}" for c,n in city]))
-    if dist:
-        lines.append("Топ районов: " + ", ".join([f"{d} {n}" for d,n in dist]))
-    if top_v:
-        lines.append("\nТоп объявлений по просмотрам:")
-        for key, n in top_v:
-            lines.append(f"  • {key}: {n}")
-    if top_l:
-        lines.append("Топ по лайкам:")
-        for key, n in top_l:
-            lines.append(f"  • {key}: {n}")
-    if top_f:
-        lines.append("Топ по избранному:")
-        for key, n in top_f:
-            lines.append(f"  • {key}: {n}")
-    return "\n".join(lines)
-
-def render_week_summary(end_day: str=None) -> str:
-    if not end_day:
-        end_day = _today_str()
-    end_dt = datetime.fromisoformat(end_day)
-    days = [(end_dt - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6,-1,-1)]
-    total = Counter()
-    for d in days:
-        total += AGG_BY_DAY[d]
-    lines = [f"📈 <b>Сводка за 7 дней (до {end_day})</b>",
-             f"Просмотры {total['view']}, лайки {total['like']}, дизлайки {total['dislike']}, заявки {total['lead']}, избранное +{total['fav_add']}/-{total['fav_remove']}"]
-    return "\n".join(lines)
-
-def export_analytics_csv(path: str = "analytics_export.csv"):
-    keys = ["ts","day","event","uid","mode","city","district","price","rooms","key","title","contact","found"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for ev in ANALYTIC_EVENTS:
-            w.writerow({k: ev.get(k,"") for k in keys})
-    return path
-
-# ---- Analytics Persistence ----
-def save_analytics_snapshot():
-    try:
-        data = {
-          "ANALYTIC_EVENTS": ANALYTIC_EVENTS,
-          "AGG_BY_DAY": {k: dict(v) for k,v in AGG_BY_DAY.items()},
-          "AGG_BY_MODE": {k: dict(v) for k,v in AGG_BY_MODE.items()},
-          "AGG_CITY": {k: dict(v) for k,v in AGG_CITY.items()},
-          "AGG_DISTRICT": {k: dict(v) for k,v in AGG_DISTRICT.items()},
-          "AGG_FUNNEL": {k: dict(v) for k,v in AGG_FUNNEL.items()},
-          "TOP_LISTINGS": {k: dict(v) for k,v in TOP_LISTINGS.items()},
-          "TOP_LIKES": {k: dict(v) for k,v in TOP_LIKES.items()},
-          "TOP_FAVS": {k: dict(v) for k,v in TOP_FAVS.items()},
-        }
-        with open(ANALYTICS_SNAPSHOT, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        logger.debug("Analytics snapshot saved")
-    except Exception as e:
-        logger.error(f"Failed to save analytics snapshot: {e}")
-
-def load_analytics_snapshot():
-    if not os.path.exists(ANALYTICS_SNAPSHOT):
-        return
-    try:
-        with open(ANALYTICS_SNAPSHOT, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        ANALYTIC_EVENTS.extend(data.get("ANALYTIC_EVENTS", []))
-        for k, d in data.get("AGG_BY_DAY", {}).items():
-            AGG_BY_DAY[k].update(d)
-        for k, d in data.get("AGG_BY_MODE", {}).items():
-            AGG_BY_MODE[k].update(d)
-        for k, d in data.get("AGG_CITY", {}).items():
-            AGG_CITY[k].update(d)
-        for k, d in data.get("AGG_DISTRICT", {}).items():
-            AGG_DISTRICT[k].update(d)
-        for k, d in data.get("AGG_FUNNEL", {}).items():
-            AGG_FUNNEL[k].update(d)
-        for k, d in data.get("TOP_LISTINGS", {}).items():
-            TOP_LISTINGS[k].update(d)
-        for k, d in data.get("TOP_LIKES", {}).items():
-            TOP_LIKES[k].update(d)
-        for k, d in data.get("TOP_FAVS", {}).items():
-            TOP_FAVS[k].update(d)
-        logger.info("Analytics snapshot loaded")
-    except Exception as e:
-        logger.warning(f"load snapshot failed: {e}")
-
-# ---- Background Tasks Management ----
-_background_tasks = set()
-
-async def create_background_task(coro, task_name: str):
-    """Safely create and track background tasks"""
-    task = asyncio.create_task(coro, name=task_name)
-    _background_tasks.add(task)
-
-    def remove_task(fut):
-        _background_tasks.discard(task)
-        if fut.exception():
-            logger.error(f"Background task {task_name} failed: {fut.exception()}")
-
-    task.add_done_callback(remove_task)
-    return task
-
-async def _auto_refresh_loop():
-    """
-    В режиме без Sheets: просто heartbeat, чтобы Railway видел «живой» процесс.
-    """
-    while True:
-        try:
-            logger.info("Bot heartbeat OK")
-        except Exception as e:
-            logger.warning(f"Heartbeat error: {e}")
-        await asyncio.sleep(600)  # 10 минут
-
-async def _midnight_flush_loop():
-    """
-    Статистики в Sheets отключены — цикл оставляем как «пустышку».
-    """
-    while True:
-        try:
-            # потенциально можно сохранять локальный снапшот/ротацию
-            pass
-        except Exception as e:
-            logger.error(f"Midnight flush loop error: {e}")
-        await asyncio.sleep(300)
-
-async def _weekly_report_loop():
-    """Еженедельный отчёт в личку админу (без Sheets)."""
-    sent_reports = set()
-    while True:
-        try:
-            now = datetime.utcnow()
-            dow = now.isoweekday()
-
-            if (dow == Config.WEEKLY_REPORT_DOW and 
-                now.hour == Config.WEEKLY_REPORT_HOUR and 
-                now.minute < 5):
-
-                report_key = now.strftime("%Y-%U")
-                if report_key not in sent_reports:
-                    try:
-                        text = render_week_summary()
-                        if Config.ADMIN_CHAT_ID:
-                            await bot.send_message(Config.ADMIN_CHAT_ID, text)
-                        sent_reports.add(report_key)
-                        logger.info("Weekly report sent successfully")
-                    except Exception as e:
-                        logger.error(f"Failed to send weekly report: {e}")
-
-            current_year = datetime.utcnow().year
-            sent_reports = {r for r in sent_reports if r.startswith(str(current_year))}
-        except Exception as e:
-            logger.error(f"Weekly report loop error: {e}")
-        await asyncio.sleep(600)
-
-async def _snapshot_loop():
-    """Сохранение локального снапшота аналитики."""
-    while True:
-        try:
-            save_analytics_snapshot()
-        except Exception as e:
-            logger.error(f"Snapshot save failed: {e}")
-        await asyncio.sleep(SNAPSHOT_INTERVAL_SEC)
-
-# ---- Improved Startup with Better Error Recovery ----
-async def startup():
-    """Старт бота: Sheets выключены, но бот должен работать стабильно."""
-    logger.info("Starting bot initialization... (Sheets disabled mode)")
-
-    # Попытка загрузить данные (вернётся пустой список)
-    try:
-        await rows_async(force=True)
-        logger.info("Initial data step completed (empty dataset in disabled mode)")
-    except Exception as e:
-        logger.error(f"Initial data load failed: {e}")
-        logger.info("Bot will start with empty cache and retry in background")
-
-    # Load analytics snapshot
-    try:
-        load_analytics_snapshot()
-    except Exception as e:
-        logger.warning(f"Failed to load analytics snapshot: {e}")
-
-    # Start background tasks with error handling
-    tasks = [
-        ("auto_refresh", _auto_refresh_loop()),
-        ("midnight_flush", _midnight_flush_loop()),
-        ("weekly_report", _weekly_report_loop()),
-        ("snapshot", _snapshot_loop())
-    ]
-
-    for task_name, task_coro in tasks:
-        try:
-            await create_background_task(task_coro, task_name)
-            logger.info(f"Started background task: {task_name}")
-        except Exception as e:
-            logger.error(f"Failed to start background task {task_name}: {e}")
-
-    logger.info(f"Bot started successfully. Admin IDs: {sorted(ADMINS_SET)}")
-    logger.info(f"Cache status: {len(_cached_rows)} rows loaded (Sheets disabled)")
-
-    # Send startup notification to admin
-    if Config.ADMIN_CHAT_ID:
-        try:
-            cache_status = f"{len(_cached_rows)} rows" if _cached_rows else "EMPTY"
-            await bot.send_message(
-                Config.ADMIN_CHAT_ID,
-                f"🤖 Bot started (Sheets disabled)\n"
-                f"📊 Cache: {cache_status}\n"
-                f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send startup notification: {e}")
-
-async def shutdown():
-    """Clean shutdown handler with better cleanup"""
-    logger.info("Shutting down bot...")
-
-    # Cancel all background tasks
-    for task in list(_background_tasks):
-        try:
-            task.cancel()
-        except Exception:
-            pass
-
-    if _background_tasks:
-        try:
-            await asyncio.wait(_background_tasks, timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning("Some background tasks didn't finish in time")
-
-    # Save analytics before shutdown
-    try:
-        save_analytics_snapshot()
-    except Exception as e:
-        logger.error(f"Failed to save analytics on shutdown: {e}")
-
-    # Close bot session
-    try:
-        await bot.session.close()
-    except Exception as e:
-        logger.error(f"Error closing bot session: {e}")
-
-    logger.info("Bot shutdown complete")
-
-# ---- Handlers for Aiogram 3.x ----
+# == Команды ==
 @dp.message(Command("start", "menu"))
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in USER_LANG:
         code = (message.from_user.language_code or "").strip()
         USER_LANG[message.from_user.id] = LANG_MAP.get(code, "ru")
-    lang = USER_LANG[message.from_user.id]
+    lang = current_lang(message.from_user.id)
     await state.clear()
     await message.answer(t(lang, "start"), reply_markup=main_menu(lang))
 
-@dp.message(Command("home"))
-async def cmd_home(message: types.Message, state: FSMContext):
-    lang = USER_LANG.get(message.from_user.id, "ru")
-    await state.clear()
-    await message.answer(t(lang, "menu_title"), reply_markup=main_menu(lang))
-
-@dp.message(Command("lang_ru", "lang_en", "lang_ka"))
-async def cmd_lang(message: types.Message):
-    code = message.text.replace("/", "").replace("lang_", "")
-    if code not in LANGS:
-        code = "ru"
-    USER_LANG[message.from_user.id] = code
-    await message.answer(t(code, "menu_title"), reply_markup=main_menu(code))
-
-@dp.message(Command("whoami"))
-async def cmd_whoami(message: types.Message, state: FSMContext):
-    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
-
-@dp.message(Command("admin_debug"))
-async def cmd_admin_debug(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
-    await message.answer(
-        "Debug:\n"
-        f"ADMIN_CHAT_ID: <code>{Config.ADMIN_CHAT_ID}</code>\n"
-        f"ADMINS (.env): <code>{os.getenv('ADMINS','')}</code>\n"
-        f"ADMINS_SET: <code>{sorted(ADMINS_SET)}</code>\n"
-        f"SHEETS_ENABLED: <code>{Config.SHEETS_ENABLED}</code>\n"
-        f"GSHEET_ID: <code>{Config.GSHEET_ID or '(not set)'}</code>\n"
-        f"GSHEET_TAB: <code>{Config.GSHEET_TAB}</code>\n"
-        f"GSHEET_STATS_ID: <code>{Config.GSHEET_STATS_ID or '(not set)'}</code>\n"
-        f"Weekly: DOW={Config.WEEKLY_REPORT_DOW}, HOUR={Config.WEEKLY_REPORT_HOUR} (UTC)\n"
-        f"ADS: enabled={Config.ADS_ENABLED}, prob={Config.ADS_PROB}, cooldown={Config.ADS_COOLDOWN_SEC}s\n"
-        f"Cache rows: {len(_cached_rows)}, TTLmin={Config.GSHEET_REFRESH_MIN}"
-    )
+@dp.message(Command("about"))
+async def cmd_about(message: types.Message):
+    await message.answer(T["about"]["ru"])
 
 @dp.message(Command("health"))
 async def cmd_health(message: types.Message):
-    try:
-        if not Config.SHEETS_ENABLED:
-            await message.answer(
-                "✅ Bot is running\n"
-                "🗂 Google Sheets: <b>disabled</b>\n"
-                f"Cache rows: {len(_cached_rows)} (stale={_is_cache_stale()})"
-            )
-            return
-        # Если включим SHEETS позже — здесь будет проверка подключения
-        await message.answer("Sheets enabled (but handler not implemented in disabled build).")
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+    await message.answer(
+        f"✅ Bot OK\n"
+        f"Sheets: ENABLED\n"
+        f"Rows cached: {len(_cached_rows)}\n"
+        f"TTL: {Config.GSHEET_REFRESH_MIN} min"
+    )
 
 @dp.message(Command("gs"))
 async def cmd_gs(message: types.Message):
-    try:
-        rows = await rows_async(force=True)
-        await message.answer(f"GS rows (disabled mode returns cache/empty): {len(rows)}")
-    except Exception as e:
-        await message.answer(f"GS error: {e}")
+    rows = await rows_async(force=True)
+    await message.answer(f"📊 Загружено строк: {len(rows)} из Google Sheets.")
 
-@dp.message(Command("reload", "refresh"))
-async def cmd_reload(message: types.Message):
-    try:
-        rows = await rows_async(force=True)
-        await message.answer(f"♻️ Reloaded (disabled mode). Rows: {len(rows)}")
-    except Exception as e:
-        await message.answer(f"Reload error: {e}")
+@dp.message(Command("refresh","reload"))
+async def cmd_refresh(message: types.Message):
+    rows = await rows_async(force=True)
+    await message.answer(f"♻️ Перезагружено. В кэше: {len(rows)} строк.")
 
-# ---- Main Execution with Proper Event Loop ----
-async def main():
-    """Main async function for Aiogram 3.x with proper event loop handling"""
-    try:
-        logger.info("Starting LivePlace bot (Sheets disabled, Railway-stable)...")
+# == Простейший сценарий поиска (мастер из 3 шагов) ==
+class Wizard(StatesGroup):
+    mode = State()
+    city = State()
+    budget = State()
 
-        # Clean up any stale webhook
+@dp.message(F.text == T["btn_search"]["ru"])
+@dp.message(Command("search"))
+async def start_search(message: types.Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(Wizard.mode)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton("rent")],[KeyboardButton("sale")],[KeyboardButton("daily")]],
+        resize_keyboard=True
+    )
+    await message.answer("Выберите режим: rent / sale / daily", reply_markup=kb)
+
+@dp.message(Wizard.mode)
+async def pick_city(message: types.Message, state: FSMContext):
+    mode = norm_mode(message.text)
+    if not mode:
+        return await message.answer("Укажи rent/sale/daily")
+    await state.update_data(mode=mode)
+
+    rows = await rows_async()
+    cities = sorted({str(r.get("city","")).strip() for r in rows if r.get("city")})
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(c)] for c in cities[:20]], resize_keyboard=True)
+    await state.set_state(Wizard.city)
+    await message.answer("Выберите город:", reply_markup=kb)
+
+@dp.message(Wizard.city)
+async def pick_budget(message: types.Message, state: FSMContext):
+    await state.update_data(city=message.text.strip())
+    await state.set_state(Wizard.budget)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton("500")],[KeyboardButton("1000")],[KeyboardButton("2000")],[KeyboardButton("5000")]],
+        resize_keyboard=True
+    )
+    await message.answer("Максимальный бюджет (число):", reply_markup=kb)
+
+@dp.message(Wizard.budget)
+async def show_results(message: types.Message, state: FSMContext):
+    try:
+        budget = float(message.text.strip())
+    except Exception:
+        return await message.answer("Введи число, например 1000")
+    data = await state.get_data()
+    query = {"mode": data["mode"], "city": data["city"], "price": budget}
+
+    rows = _filter_rows(await rows_async(), query)
+    USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
+
+    if not rows:
+        await message.answer("Ничего не найдено.", reply_markup=main_menu("ru"))
+        return
+
+    await send_page(message.chat.id, message.from_user.id, 0)
+    await state.clear()
+
+async def send_page(chat_id: int, uid: int, page: int):
+    bundle = USER_RESULTS.get(uid)
+    if not bundle: return
+    rows = bundle["rows"]
+    page = max(0, min(page, (len(rows)-1)//PAGE_SIZE))
+    bundle["page"] = page
+
+    chunk = _slice(rows, page, PAGE_SIZE)
+    if not chunk:
+        await bot.send_message(chat_id, "Больше объявлений нет.")
+        return
+
+    for r in chunk:
+        photos = collect_photos(r)
+        text = format_card(r, "ru")
+        if photos:
+            media = [InputMediaPhoto(media=photos[0], caption=text)]
+            for p in photos[1:10]:
+                media.append(InputMediaPhoto(media=p))
+            try:
+                await bot.send_media_group(chat_id, media)
+            except Exception:
+                await bot.send_message(chat_id, text)
+        else:
+            await bot.send_message(chat_id, text)
+        await asyncio.sleep(0.2)
+
+    nav = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="« Назад", callback_data="nav:prev"),
+            InlineKeyboardButton(text=f"{page+1}/{(len(rows)-1)//PAGE_SIZE+1}", callback_data="noop"),
+            InlineKeyboardButton(text="Вперёд »", callback_data="nav:next"),
+        ]
+    ])
+    await bot.send_message(chat_id, "Навигация:", reply_markup=nav)
+    # возможно показать рекламу
+    dummy = types.Message(chat=types.Chat(id=chat_id, type="private"), message_id=0, date=datetime.now())
+    await maybe_show_ad(dummy, uid)
+
+@dp.callback_query(F.data.startswith("nav:"))
+async def cb_nav(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    bundle = USER_RESULTS.get(uid)
+    if not bundle:
+        return await cb.answer("Список пуст.")
+    page = bundle["page"]
+    if cb.data == "nav:prev":
+        page -= 1
+    elif cb.data == "nav:next":
+        page += 1
+    await cb.answer()
+    await send_page(cb.message.chat.id, uid, page)
+
+# == Аналитика (упрощённая) ==
+ANALYTIC_EVENTS: List[Dict[str, Any]] = []
+AGG_BY_DAY = defaultdict(lambda: Counter())
+
+def _today_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def log_event(event: str, uid: int):
+    day = _today_str()
+    ANALYTIC_EVENTS.append({"event": event, "uid": uid, "day": day, "ts": datetime.utcnow().isoformat(timespec="seconds")})
+    AGG_BY_DAY[day][event] += 1
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    d = _today_str()
+    c = AGG_BY_DAY[d]
+    await message.answer(
+        f"📊 Сегодня: search={c['search']}, view={c['view']}, leads={c['lead']}"
+    )
+
+# == Старт/останов ==
+async def heartbeat():
+    while True:
         try:
-            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Heartbeat OK")
         except Exception:
             pass
+        await asyncio.sleep(600)
 
-        # Run startup tasks
+async def startup():
+    await rows_async(force=True)
+    if Config.ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(Config.ADMIN_CHAT_ID, "🤖 LivePlace bot started (Sheets enabled)")
+        except Exception:
+            pass
+    asyncio.create_task(heartbeat())
+
+async def shutdown():
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+    logger.info("Bot shutdown complete")
+
+async def main():
+    try:
         await startup()
-
-        logger.info("Starting polling...")
-        # Start polling with proper event loop
+        logger.info("Starting polling…")
         await dp.start_polling(bot)
-
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-
-        # Try to send crash notification
-        if Config.ADMIN_CHAT_ID:
-            try:
-                await bot.send_message(
-                    Config.ADMIN_CHAT_ID,
-                    f"🚨 Bot crashed:\n{str(e)}"
-                )
-            except Exception:
-                pass
     finally:
-        # Ensure cleanup happens
         await shutdown()
-        logger.info("Bot process ended")
 
 if __name__ == "__main__":
-    try:
-        # Proper asyncio run for Aiogram 3.x
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user (Ctrl+C)")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-
-
-
-
-
+    asyncio.run(main())
