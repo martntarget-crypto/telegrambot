@@ -172,7 +172,7 @@ def get_worksheet():
     return sheets_manager.get_worksheet()
 
 
-sheets_manager = SheetsManagerDisabled()
+sheets_manager = SheetsManager()
 
 def open_spreadsheet():
     raise RuntimeError("Sheets disabled: set SHEETS_ENABLED=1 to enable")
@@ -1025,5 +1025,6 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
 
 
