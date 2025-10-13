@@ -326,7 +326,7 @@ async def maybe_show_ad_by_chat(chat_id: int, uid: int):
     LAST_AD_ID[uid] = ad.get("id")
 
 # == Поиск ==
-def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]] -> List[Dict[str, Any]]:
+def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str, Any]]:
     def ok(r):
         if q.get("mode") and norm_mode(r.get("mode")) != q["mode"]: return False
         if q.get("city") and norm(r.get("city")) != norm(q["city"]): return False
@@ -566,3 +566,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
