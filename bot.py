@@ -288,14 +288,16 @@ def build_utm_url(raw: str, ad_id: str, uid: int) -> str:
     new_q = urlencode({k: v[0] for k, v in q.items()})
     return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
-# ---- Menu System ----
 def main_menu(lang: str) -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton(T["btn_fast"][lang]))
-    kb.row(KeyboardButton(T["btn_search"][lang]), KeyboardButton(T["btn_latest"][lang]))
-    kb.add(KeyboardButton(T["btn_favs"][lang]))
-    kb.add(KeyboardButton(T["btn_language"][lang]), KeyboardButton(T["btn_about"][lang]))
-    return kb
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(T["btn_fast"][lang])],
+            [KeyboardButton(T["btn_search"][lang]), KeyboardButton(T["btn_latest"][lang])],
+            [KeyboardButton(T["btn_favs"][lang])],
+            [KeyboardButton(T["btn_language"][lang]), KeyboardButton(T["btn_about"][lang])]
+        ],
+        resize_keyboard=True
+    )
 
 # ---- Utilities ----
 def norm(s: str) -> str:
@@ -973,3 +975,4 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
