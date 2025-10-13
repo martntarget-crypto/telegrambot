@@ -120,71 +120,27 @@ dp = Dispatcher(storage=storage)
 # ---------------------------------------------------------------------
 #  Google Sheets subsystem — ENABLED via GOOGLE_CREDENTIALS_JSON
 # ---------------------------------------------------------------------
-import json
 import gspread
 from google.oauth2.service_account import Credentials
 
 class SheetsManager:
     def __init__(self):
-        self._gc = None
-        self._ws = None
+        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if not creds_json:
+            raise RuntimeError("Missing GOOGLE_CREDENTIALS_JSON")
 
-    def get_client(self):
-        if self._gc is not None:
-            return self._gc
-        creds_raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-        if not creds_raw:
-            raise RuntimeError("GOOGLE_CREDENTIALS_JSON is empty")
-        try:
-            creds_info = json.loads(creds_raw)
-        except Exception as e:
-            raise RuntimeError(f"GOOGLE_CREDENTIALS_JSON is not valid JSON: {e}")
+        creds = Credentials.from_service_account_info(json.loads(creds_json),
+                                                      scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        self.client = gspread.authorize(creds)
+        self.sheet_id = os.getenv("GSHEET_ID")
+        self.tab_name = os.getenv("GSHEET_TAB", "Ads")
 
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ]
-        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-        self._gc = gspread.authorize(creds)
-        return self._gc
-
-    def open_spreadsheet(self):
-        gc = self.get_client()
-        sid = Config.GSHEET_ID
-        if not sid:
-            raise RuntimeError("GSHEET_ID is not set")
-        try:
-            return gc.open_by_key(sid)
-        except Exception as e:
-            raise RuntimeError(f"Failed to open spreadsheet {sid}: {e}")
-
-    def get_worksheet(self):
-        if self._ws is not None:
-            return self._ws
-        sh = self.open_spreadsheet()
-        tab = Config.GSHEET_TAB or "Ads"
-        try:
-            self._ws = sh.worksheet(tab)
-            return self._ws
-        except Exception as e:
-            raise RuntimeError(f"Failed to open worksheet '{tab}': {e}")
+    def get_rows(self):
+        sheet = self.client.open_by_key(self.sheet_id).worksheet(self.tab_name)
+        return sheet.get_all_records()
 
 sheets_manager = SheetsManager()
-
-def open_spreadsheet():
-    return sheets_manager.open_spreadsheet()
-
-def get_worksheet():
-    return sheets_manager.get_worksheet()
-
-
-sheets_manager = SheetsManager()
-
-def open_spreadsheet():
-    raise RuntimeError("Sheets disabled: set SHEETS_ENABLED=1 to enable")
-
-def get_worksheet():
-    raise RuntimeError("Sheets disabled: set SHEETS_ENABLED=1 to enable")
+logger.info("Starting LivePlace bot (Sheets enabled, Railway-stable)...")
 
 # ---- Data Management with Graceful Degradation ----
 REQUIRED_COLUMNS = {
@@ -1031,6 +987,7 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
 
 
 
