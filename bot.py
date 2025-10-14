@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
-# LivePlace Telegram Bot — Railway-ready (Sheets ENABLED)
-# Полная рабочая версия bot.py с реальным подключением к Google Sheets.
+# LivePlace Telegram Bot — Полная версия, Railway-ready
+# Требования окружения:
+#   API_TOKEN=...
+#   GOOGLE_CREDENTIALS_JSON=...
+#   GSHEET_ID=...
+#   GSHEET_TAB=Ads
+#   SHEETS_ENABLED=1
+#   ADMIN_CHAT_ID=...  (опционально)
 
 import os
 import re
@@ -9,10 +15,9 @@ import time
 import random
 import asyncio
 import logging
-from time import monotonic
 from datetime import datetime
-from typing import List, Dict, Any
 from collections import Counter, defaultdict
+from typing import List, Dict, Any
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 
 from aiogram import Bot, Dispatcher, types, F
@@ -22,14 +27,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 
-# == Logging ==
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("liveplace")
 
-# == .env ==
+# .env локально (не обязательно)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -40,30 +42,24 @@ except Exception:
 class Config:
     API_TOKEN = os.getenv("API_TOKEN", "").strip()
     ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
-
     SHEETS_ENABLED = os.getenv("SHEETS_ENABLED", "1").strip() not in {"", "0", "false", "False"}
     GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
     GSHEET_TAB = os.getenv("GSHEET_TAB", "Ads").strip()
     GSHEET_REFRESH_MIN = int(os.getenv("GSHEET_REFRESH_MIN", "2") or "2")
-
-    # Рекламные UTM
     UTM_SOURCE = os.getenv("UTM_SOURCE", "telegram")
     UTM_MEDIUM = os.getenv("UTM_MEDIUM", "bot")
     UTM_CAMPAIGN = os.getenv("UTM_CAMPAIGN", "bot_ads")
-
-    # Реклама/частота
-    ADS_ENABLED = os.getenv("ADS_ENABLED", "1").strip() not in {"0","false","False",""}
+    ADS_ENABLED = os.getenv("ADS_ENABLED", "1") not in {"0", "false", "False", ""}
     ADS_PROB = float(os.getenv("ADS_PROB", "0.18"))
     ADS_COOLDOWN_SEC = int(os.getenv("ADS_COOLDOWN_SEC", "180"))
 
 if not Config.API_TOKEN:
     raise RuntimeError("API_TOKEN is not set. Add it to Railway Variables.")
 
-# == Bot ==
 bot = Bot(token=Config.API_TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage())
 
-# == Google Sheets ==
+# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -93,19 +89,19 @@ class SheetsManager:
 
 sheets = SheetsManager()
 
-# == Кэш объявлений ==
+# Кэш
 _cached_rows: List[Dict[str, Any]] = []
 _cache_ts: float = 0.0
 CACHE_TTL = max(1, Config.GSHEET_REFRESH_MIN) * 60
 
 def load_rows(force: bool = False) -> List[Dict[str, Any]]:
     global _cached_rows, _cache_ts
-    if not force and _cached_rows and (monotonic() - _cache_ts) < CACHE_TTL:
+    if not force and _cached_rows and (time.monotonic() - _cache_ts) < CACHE_TTL:
         return _cached_rows
     try:
         data = sheets.get_rows()
         _cached_rows = data
-        _cache_ts = monotonic()
+        _cache_ts = time.monotonic()
         return data
     except Exception as e:
         logger.error(f"Failed to load rows from Sheets: {e}")
@@ -114,7 +110,7 @@ def load_rows(force: bool = False) -> List[Dict[str, Any]]:
 async def rows_async(force: bool = False) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(load_rows, force)
 
-# == Локализация и тексты ==
+# Локализация
 LANGS = ["ru", "en", "ka"]
 USER_LANG: Dict[int, str] = {}
 LANG_MAP = {"ru":"ru","ru-RU":"ru","en":"en","en-US":"en","en-GB":"en","ka":"ka","ka-GE":"ka"}
@@ -137,7 +133,6 @@ T = {
     "btn_dislike": {"ru": "👎 Дизлайк", "en": "👎 Dislike", "ka": "👎 არ მომწონს"},
     "btn_fav_add": {"ru": "⭐ В избранное", "en": "⭐ Favorite", "ka": "⭐ რჩეულებში"},
     "btn_fav_del": {"ru": "⭐ Удалить из избранного", "en": "⭐ Remove favorite", "ka": "⭐ წაშლა"},
-
     "start": {
         "ru": "<b>LivePlace</b>\n👋 Привет! Я помогу подобрать <b>идеальную недвижимость в Грузии</b>.\n\n<b>Как это работает?</b>\n— Задам 3–4 простых вопроса\n— Покажу лучшие варианты с фото и телефоном владельца\n— Просто посмотреть? Жми <b>🟢 Быстрый подбор</b>\n\nДобро пожаловать и удачного поиска! 🏡",
         "en": "<b>LivePlace</b>\n👋 Hi! I'll help you find <b>your ideal home in Georgia</b>.\n\n<b>How it works:</b>\n— 3–4 quick questions\n— Top options with photos & owner phone\n— Just browsing? Tap <b>🟢 Quick picks</b>\n\nWelcome and happy hunting! 🏡",
@@ -178,28 +173,7 @@ def main_menu(lang: str) -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-# == FSM ==
-class Wizard(StatesGroup):
-    mode = State()
-    city = State()
-    district = State()
-    budget = State()
-
-# == Словари для городов и цен ==
-CITY_ICONS = {"Тбилиси":"🏙", "Батуми":"🌊", "Кутаиси":"🏛"}
-PRICE_RANGES = {
-    "rent":["500","1000","1500","2000"],
-    "sale":["50000","100000","150000","200000"],
-    "daily":["50","100","150","200"]
-}
-
-# == Пользовательские данные ==
-PAGE_SIZE = 8
-USER_RESULTS: Dict[int, Dict[str, Any]] = {}
-LAST_AD_TIME: Dict[int, float] = {}
-LAST_AD_ID: Dict[int, str] = {}
-
-# == Утилиты ==
+# == Utilities ==
 def norm(s: Any) -> str:
     return str(s or "").strip().lower()
 
@@ -272,135 +246,75 @@ def format_card(row: Dict[str, Any], lang: str) -> str:
     except Exception:
         pass
 
-    txt = f"<b>{title}</b>\n"
-    txt += f"{desc}\n"
-    txt += f"<b>Город:</b> {city}\n<b>Район:</b> {district}\n<b>Тип:</b> {rtype}\n<b>Комнат:</b> {rooms}\n<b>Цена:</b> {price}\n<b>Телефон:</b> {phone}\n"
-    txt += f"<i>Дата публикации: {pub_txt}</i>"
-    return txt
+    lines = []
+    if title: lines.append(f"<b>{title}</b>")
+    info_line = " • ".join([x for x in [rtype or "", rooms or "", f"{city}, {district}".strip(", ")] if x])
+    if info_line: lines.append(info_line)
+    if price: lines.append(f"Цена: {price}")
+    if pub_txt: lines.append(f"Опубликовано: {pub_txt}")
+    if desc: lines.append(desc)
+    if phone: lines.append(f"<b>Телефон:</b> {phone}")
+    if not desc and not phone: lines.append("—")
+    return "\n".join(lines)
+
+# == Пользовательские состояния ==
+class Search(StatesGroup):
+    mode = State()
+    city = State()
+    district = State()
+    rtype = State()
+    rooms = State()
+    price = State()
+
+# == Данные пользователя ==
+PAGE_SIZE = 8
+USER_RESULTS: Dict[int, Dict[str, Any]] = {}
+USER_FAVS: Dict[int, List[str]] = {}
+LAST_AD_TIME: Dict[int, float] = {}
+
+# == Ads ==
+def maybe_send_ad(uid: int) -> bool:
+    if not Config.ADS_ENABLED: return False
+    now = time.monotonic()
+    last = LAST_AD_TIME.get(uid, 0)
+    if now - last < Config.ADS_COOLDOWN_SEC: return False
+    if random.random() > Config.ADS_PROB: return False
+    LAST_AD_TIME[uid] = now
+    # Пример: отправляем простое рекламное сообщение
+    asyncio.create_task(bot.send_message(uid, "💰 Реклама: попробуйте новые варианты LivePlace!"))
+    return True
 
 # == Handlers ==
-
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
-    lang = current_lang(message.from_user.id)
+async def cmd_start(msg: types.Message, state: FSMContext):
+    lang = current_lang(msg.from_user.id)
     await state.clear()
-    await message.answer(T["start"][lang], reply_markup=main_menu(lang))
+    maybe_send_ad(msg.from_user.id)
+    await msg.answer(T["start"][lang], reply_markup=main_menu(lang))
 
-@dp.message(F.text.in_([T["btn_fast"]["ru"],T["btn_fast"]["en"],T["btn_fast"]["ka"]]))
-async def fast_pick(message: types.Message, state: FSMContext):
-    await Wizard.mode.set()
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton(T["btn_rent"][current_lang(message.from_user.id)]))
-    kb.add(KeyboardButton(T["btn_sale"][current_lang(message.from_user.id)]))
-    kb.add(KeyboardButton(T["btn_daily"][current_lang(message.from_user.id)]))
-    await message.answer("Выберите режим поиска", reply_markup=kb)
-
-@dp.message(Wizard.mode)
-async def pick_mode(message: types.Message, state: FSMContext):
-    mode = norm_mode(message.text)
-    if not mode:
-        await message.answer("Не распознано, выберите режим:")
-        return
-    await state.update_data(mode=mode)
-    await Wizard.city.set()
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    for c in CITY_ICONS.keys():
-        kb.add(KeyboardButton(f"{CITY_ICONS[c]} {c}"))
-    await message.answer("Выберите город:", reply_markup=kb)
-
-@dp.message(Wizard.city)
-async def pick_city(message: types.Message, state: FSMContext):
-    city = re.sub(r"^[^А-Яа-яA-Za-z]*","", message.text).strip()
-    await state.update_data(city=city)
-    await Wizard.district.set()
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    # Здесь можно динамически подтягивать районы из Sheets
-    districts = ["Весь город", "Центр", "Сабуртало", "Вере"]  # пример
-    for d in districts: kb.add(KeyboardButton(d))
-    await message.answer("Выберите район или Пропустить:", reply_markup=kb)
-
-@dp.message(Wizard.district)
-async def pick_district(message: types.Message, state: FSMContext):
-    district = message.text.strip()
-    if district.lower() in {"пропустить","весь город"}:
-        district = ""
-    await state.update_data(district=district)
-    data = await state.get_data()
-    mode = data.get("mode")
-    await Wizard.budget.set()
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    for p in PRICE_RANGES.get(mode, ["Пропустить"]):
-        kb.add(KeyboardButton(p))
-    kb.add(KeyboardButton("Пропустить"))
-    await message.answer("Выберите бюджет:", reply_markup=kb)
-
-@dp.message(Wizard.budget)
-async def pick_price(message: types.Message, state: FSMContext):
-    budget = message.text.strip()
-    if budget.lower() in {"пропустить","весь диапазон"}:
-        budget = ""
-    await state.update_data(budget=budget)
-    data = await state.get_data()
-    await show_results(message.from_user.id, data, state)
-
-# == Результаты ==
-async def show_results(uid: int, data: Dict[str, Any], state: FSMContext):
-    rows = await rows_async()
-    mode, city, district, budget = data.get("mode"), data.get("city"), data.get("district"), data.get("budget")
-    filtered = []
-    for r in rows:
-        if mode and norm_mode(r.get("mode","")) != mode: continue
-        if city and norm(r.get("city","")) != norm(city): continue
-        if district and norm(r.get("district","")) != norm(district): continue
-        if budget:
-            try:
-                if float(r.get("price",0)) > float(budget): continue
-            except Exception: pass
-        filtered.append(r)
-
-    if not filtered:
-        await bot.send_message(uid, "По вашему запросу ничего не найдено.", reply_markup=main_menu(current_lang(uid)))
-        await state.clear()
-        return
-
-    USER_RESULTS[uid] = {"rows": filtered, "page":0}
-    await send_page(uid)
-
-async def send_page(uid: int):
-    res = USER_RESULTS.get(uid)
-    if not res: return
-    rows = res["rows"]
-    page = res["page"]
-    row = rows[page]
-    lang = current_lang(uid)
-    photos = collect_photos(row)
-    text = format_card(row, lang)
+@dp.message(lambda m: m.text in [T["btn_language"].get(current_lang(m.from_user.id))])
+async def choose_language(msg: types.Message):
     kb = InlineKeyboardMarkup(row_width=3)
-    if page>0:
-        kb.insert(InlineKeyboardButton(T["btn_prev"][lang], callback_data="prev"))
-    if page<len(rows)-1:
-        kb.insert(InlineKeyboardButton(T["btn_next"][lang], callback_data="next"))
-    kb.add(InlineKeyboardButton(T["btn_fav_add"][lang], callback_data="fav"))
-    if photos:
-        media = [InputMediaPhoto(m, caption=text) for m in photos[:10]]
-        await bot.send_media_group(uid, media)
-        await bot.send_message(uid, "Следующий вариант:", reply_markup=kb)
-    else:
-        await bot.send_message(uid, text, reply_markup=kb)
+    for l in LANGS:
+        kb.add(InlineKeyboardButton(text=l.upper(), callback_data=f"lang:{l}"))
+    await msg.answer("Выберите язык / Choose language / ენა", reply_markup=kb)
 
-@dp.callback_query(F.data.in_({"prev","next","fav"}))
-async def cb_page(cq: types.CallbackQuery):
-    uid = cq.from_user.id
-    res = USER_RESULTS.get(uid)
-    if not res: return
-    if cq.data=="prev": res["page"] = max(0, res["page"]-1)
-    if cq.data=="next": res["page"] = min(len(res["rows"])-1, res["page"]+1)
-    await send_page(uid)
-    await cq.answer()
+@dp.callback_query(F.data.startswith("lang:"))
+async def set_language(c: types.CallbackQuery):
+    uid = c.from_user.id
+    lang = c.data.split(":")[1]
+    USER_LANG[uid] = lang
+    await c.message.edit_text(f"Язык установлен: {lang.upper()}", reply_markup=None)
+    await c.answer()
+    await c.message.answer("Меню:", reply_markup=main_menu(lang))
 
-# == Запуск ==
-if __name__=="__main__":
-    import asyncio
-    from aiogram import executor
-    logger.info("LivePlace bot is running…")
-    executor.start_polling(dp, skip_updates=True)
+# == Polling / Deployment-ready ==
+async def main():
+    try:
+        logger.info("LivePlace bot starting…")
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
