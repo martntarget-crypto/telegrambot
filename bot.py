@@ -1,25 +1,29 @@
 # -*- coding: utf-8 -*-
-# LivePlace Telegram Bot — Полная версия, Railway-ready
-# Требования окружения:
-#   API_TOKEN=...
-#   GOOGLE_CREDENTIALS_JSON=...
-#   GSHEET_ID=...
+# LivePlace Telegram Bot — Railway-ready (Sheets ENABLED)
+# Полная рабочая версия bot.py с реальным подключением к Google Sheets.
+# Требования окружения (Railway → Variables):
+#   API_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
+#   GOOGLE_CREDENTIALS_JSON={...весь JSON сервис-аккаунта...}
+#   GSHEET_ID=1yrB5Vy7o18B05nkJBqQe9hE9971jJsTMEKKTsDHGa8w
 #   GSHEET_TAB=Ads
 #   SHEETS_ENABLED=1
-#   ADMIN_CHAT_ID=...  (опционально)
+#   ADMIN_CHAT_ID=640007272   (опционально)
 
 import os
 import re
+import csv
 import json
 import time
 import random
 import asyncio
 import logging
+from time import monotonic
 from datetime import datetime
-from collections import Counter, defaultdict
 from typing import List, Dict, Any
+from collections import Counter, defaultdict
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 
+# == Aiogram 3.x ==
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -27,11 +31,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# == Logging ==
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("liveplace")
 
-# .env локально (не обязательно)
+# == .env (локально не требуется, но не мешает) ==
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -56,10 +63,11 @@ class Config:
 if not Config.API_TOKEN:
     raise RuntimeError("API_TOKEN is not set. Add it to Railway Variables.")
 
+# == Bot ==
 bot = Bot(token=Config.API_TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage())
 
-# Google Sheets
+# == Google Sheets ==
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -89,19 +97,19 @@ class SheetsManager:
 
 sheets = SheetsManager()
 
-# Кэш
+# == Кэш объявлений ==
 _cached_rows: List[Dict[str, Any]] = []
 _cache_ts: float = 0.0
 CACHE_TTL = max(1, Config.GSHEET_REFRESH_MIN) * 60
 
 def load_rows(force: bool = False) -> List[Dict[str, Any]]:
     global _cached_rows, _cache_ts
-    if not force and _cached_rows and (time.monotonic() - _cache_ts) < CACHE_TTL:
+    if not force and _cached_rows and (monotonic() - _cache_ts) < CACHE_TTL:
         return _cached_rows
     try:
         data = sheets.get_rows()
         _cached_rows = data
-        _cache_ts = time.monotonic()
+        _cache_ts = monotonic()
         return data
     except Exception as e:
         logger.error(f"Failed to load rows from Sheets: {e}")
@@ -110,7 +118,7 @@ def load_rows(force: bool = False) -> List[Dict[str, Any]]:
 async def rows_async(force: bool = False) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(load_rows, force)
 
-# Локализация
+# == Локализация ==
 LANGS = ["ru", "en", "ka"]
 USER_LANG: Dict[int, str] = {}
 LANG_MAP = {"ru":"ru","ru-RU":"ru","en":"en","en-US":"en","en-GB":"en","ka":"ka","ka-GE":"ka"}
@@ -173,7 +181,7 @@ def main_menu(lang: str) -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-# == Utilities ==
+# == Утилиты ==
 def norm(s: Any) -> str:
     return str(s or "").strip().lower()
 
@@ -213,108 +221,99 @@ def parse_rooms(v: Any) -> float:
     try: return float(s.replace("+",""))
     except Exception: return -1.0
 
-def build_utm_url(raw: str, ad_id: str, uid: int) -> str:
-    if not raw: return "https://liveplace.com.ge/"
-    seed = f"{uid}:{datetime.utcnow().strftime('%Y%m%d')}:{ad_id}".encode()
-    token = __import__("hashlib").sha256(seed).hexdigest()[:16]
-    u = urlparse(raw); q = parse_qs(u.query)
-    q["utm_source"]=[Config.UTM_SOURCE]
-    q["utm_medium"]=[Config.UTM_MEDIUM]
-    q["utm_campaign"]=[Config.UTM_CAMPAIGN]
-    q["utm_content"]=[ad_id]
-    q["token"]=[token]
-    new_q = urlencode({k: v[0] for k,v in q.items()})
-    return urlunparse((u.scheme,u.netloc,u.path,u.params,new_q,u.fragment))
+def build_utm_url(raw: str, uid: int) -> str:
+    if not raw: return raw
+    parts = urlparse(raw)
+    query = parse_qs(parts.query)
+    query.update({
+        "utm_source": [Config.UTM_SOURCE],
+        "utm_medium": [Config.UTM_MEDIUM],
+        "utm_campaign": [Config.UTM_CAMPAIGN],
+        "utm_term": [str(uid)]
+    })
+    new_q = urlencode(query, doseq=True)
+    return urlunparse(parts._replace(query=new_q))
 
-def format_card(row: Dict[str, Any], lang: str) -> str:
-    title_k = LANG_FIELDS[lang]["title"]
-    desc_k  = LANG_FIELDS[lang]["desc"]
-    city     = str(row.get("city","")).strip()
-    district = str(row.get("district","")).strip()
-    rtype    = str(row.get("type","")).strip()
-    rooms    = str(row.get("rooms","")).strip()
-    price    = str(row.get("price","")).strip()
-    published= str(row.get("published","")).strip()
-    phone    = str(row.get("phone","")).strip()
-    title    = str(row.get(title_k,"")).strip()
-    desc     = str(row.get(desc_k,"")).strip()
-
-    pub_txt = published
-    try:
-        dt = datetime.fromisoformat(published)
-        pub_txt = dt.strftime("%Y-%m-%d")
-    except Exception:
-        pass
-
-    lines = []
-    if title: lines.append(f"<b>{title}</b>")
-    info_line = " • ".join([x for x in [rtype or "", rooms or "", f"{city}, {district}".strip(", ")] if x])
-    if info_line: lines.append(info_line)
-    if price: lines.append(f"Цена: {price}")
-    if pub_txt: lines.append(f"Опубликовано: {pub_txt}")
-    if desc: lines.append(desc)
-    if phone: lines.append(f"<b>Телефон:</b> {phone}")
-    if not desc and not phone: lines.append("—")
-    return "\n".join(lines)
-
-# == Пользовательские состояния ==
-class Search(StatesGroup):
-    mode = State()
+# == FSM ==
+class Wizard(StatesGroup):
     city = State()
     district = State()
-    rtype = State()
-    rooms = State()
-    price = State()
-
-# == Данные пользователя ==
-PAGE_SIZE = 8
-USER_RESULTS: Dict[int, Dict[str, Any]] = {}
-USER_FAVS: Dict[int, List[str]] = {}
-LAST_AD_TIME: Dict[int, float] = {}
-
-# == Ads ==
-def maybe_send_ad(uid: int) -> bool:
-    if not Config.ADS_ENABLED: return False
-    now = time.monotonic()
-    last = LAST_AD_TIME.get(uid, 0)
-    if now - last < Config.ADS_COOLDOWN_SEC: return False
-    if random.random() > Config.ADS_PROB: return False
-    LAST_AD_TIME[uid] = now
-    # Пример: отправляем простое рекламное сообщение
-    asyncio.create_task(bot.send_message(uid, "💰 Реклама: попробуйте новые варианты LivePlace!"))
-    return True
+    budget = State()
+    mode = State()
 
 # == Handlers ==
 @dp.message(Command("start"))
-async def cmd_start(msg: types.Message, state: FSMContext):
-    lang = current_lang(msg.from_user.id)
+async def start_cmd(msg: types.Message, state: FSMContext):
+    uid = msg.from_user.id
+    USER_LANG[uid] = LANG_MAP.get(msg.from_user.language_code, "ru")
     await state.clear()
-    maybe_send_ad(msg.from_user.id)
-    await msg.answer(T["start"][lang], reply_markup=main_menu(lang))
+    await msg.answer(T["start"][current_lang(uid)], reply_markup=main_menu(current_lang(uid)))
 
-@dp.message(lambda m: m.text in [T["btn_language"].get(current_lang(m.from_user.id))])
-async def choose_language(msg: types.Message):
-    kb = InlineKeyboardMarkup(row_width=3)
-    for l in LANGS:
-        kb.add(InlineKeyboardButton(text=l.upper(), callback_data=f"lang:{l}"))
-    await msg.answer("Выберите язык / Choose language / ენა", reply_markup=kb)
+@dp.message(F.text == T["btn_about"]["ru"] or F.text == T["btn_about"]["en"])
+async def about(msg: types.Message):
+    lang = current_lang(msg.from_user.id)
+    await msg.answer(T["about"][lang])
 
-@dp.callback_query(F.data.startswith("lang:"))
-async def set_language(c: types.CallbackQuery):
-    uid = c.from_user.id
-    lang = c.data.split(":")[1]
-    USER_LANG[uid] = lang
-    await c.message.edit_text(f"Язык установлен: {lang.upper()}", reply_markup=None)
-    await c.answer()
-    await c.message.answer("Меню:", reply_markup=main_menu(lang))
+# == FSM: Быстрый подбор ==
+@dp.message(F.text == T["btn_fast"]["ru"] or F.text == T["btn_fast"]["en"])
+async def wizard_start(msg: types.Message, state: FSMContext):
+    await state.set_state(Wizard.city)
+    await msg.answer("Введите город или район:")
 
-# == Polling / Deployment-ready ==
+@dp.message(F.state == Wizard.city)
+async def wizard_city(msg: types.Message, state: FSMContext):
+    await state.update_data(city=msg.text)
+    await state.set_state(Wizard.budget)
+    await msg.answer("Введите бюджет (в USD):")
+
+@dp.message(F.state == Wizard.budget)
+async def wizard_budget(msg: types.Message, state: FSMContext):
+    await state.update_data(budget=msg.text)
+    await state.set_state(Wizard.mode)
+    await msg.answer("Выберите тип: аренда / продажа:")
+
+@dp.message(F.state == Wizard.mode)
+async def wizard_mode(msg: types.Message, state: FSMContext):
+    mode_norm = norm_mode(msg.text)
+    if not mode_norm:
+        await msg.answer("Некорректный выбор, попробуйте снова.")
+        return
+    await state.update_data(mode=mode_norm)
+    data = await state.get_data()
+    # == поиск по Sheets ==
+    rows = await rows_async()
+    res = []
+    city_norm = norm(data.get("city"))
+    mode_val = data.get("mode")
+    budget_val = float(data.get("budget") or 0)
+    for r in rows:
+        if norm(r.get("city")) != city_norm: continue
+        if norm_mode(r.get("mode")) != mode_val: continue
+        price = float(r.get("price") or 0)
+        if price > budget_val: continue
+        res.append(r)
+    if not res:
+        await msg.answer("По вашим параметрам вариантов не найдено.")
+    else:
+        for r in res[:10]:
+            lang = current_lang(msg.from_user.id)
+            title = r.get(LANG_FIELDS[lang]["title"]) or r.get(LANG_FIELDS["ru"]["title"])
+            desc = r.get(LANG_FIELDS[lang]["desc"]) or r.get(LANG_FIELDS["ru"]["desc"])
+            url = build_utm_url(r.get("link"), msg.from_user.id)
+            photos = collect_photos(r)
+            if photos:
+                media = [InputMediaPhoto(media=p, caption=f"{title}\n{desc}\n{url}") for p in photos]
+                await msg.answer_media_group(media)
+            else:
+                await msg.answer(f"{title}\n{desc}\n{url}")
+    await state.clear()
+    await msg.answer("Вы вернулись в меню", reply_markup=main_menu(current_lang(msg.from_user.id)))
+
+# == Polling ==
 async def main():
-    try:
-        logger.info("LivePlace bot starting…")
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    logger.info("LivePlace bot starting…")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
