@@ -414,7 +414,8 @@ async def cmd_refresh(message: types.Message):
 async def start_search(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(Wizard.mode)
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    # aiogram 3.x requires keyboard kw when creating ReplyKeyboardMarkup
+    kb = ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
     kb.add(KeyboardButton(T["btn_rent"][current_lang(message.from_user.id)]))
     kb.add(KeyboardButton(T["btn_sale"][current_lang(message.from_user.id)]))
     kb.add(KeyboardButton(T["btn_daily"][current_lang(message.from_user.id)]))
@@ -482,7 +483,7 @@ async def pick_rooms_or_price(message: types.Message, state: FSMContext):
 
     # ask rooms
     await state.set_state(Wizard.rooms)
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb = ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
     kb.add(KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3"))
     kb.add(KeyboardButton("4"), KeyboardButton("5+"), KeyboardButton("Пропустить"))
     await message.answer("Выберите количество комнат (1,2,3,4,5+ или Пропустить):", reply_markup=kb)
@@ -645,7 +646,10 @@ async def cb_set_lang(cb: types.CallbackQuery):
     lang = cb.data.split(":")[1]
     USER_LANG[uid] = lang
     await cb.answer(f"Язык установлен: {lang.upper()}")
-    await cb.message.delete()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
     await cb.message.answer("Меню:", reply_markup=main_menu(lang))
 
 @dp.message(F.text == T["btn_fast"]["ru"])
@@ -655,7 +659,8 @@ async def quick_pick_entry(msg: types.Message, state: FSMContext):
     # Quick pick - a simplified variant: ask mode then show top N newest
     await state.clear()
     await state.set_state(Wizard.mode)
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    # aiogram 3.x requires keyboard kw when creating ReplyKeyboardMarkup
+    kb = ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
     kb.add(KeyboardButton(T["btn_rent"][current_lang(msg.from_user.id)]))
     kb.add(KeyboardButton(T["btn_sale"][current_lang(msg.from_user.id)]))
     kb.add(KeyboardButton(T["btn_daily"][current_lang(msg.from_user.id)]))
