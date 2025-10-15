@@ -190,7 +190,6 @@ CITY_ICONS = {
     "тбилиси": "🏙",
     "батуми": "🌊",
     "кутаиси": "⛰",
-    # add more mappings as needed (use lowercase keys)
 }
 PRICE_RANGES = {
     "sale": ["35000$-", "35000$-50000$", "50000$-75000$", "75000$-100000$", "100000$-150000$", "150000$+"],
@@ -204,9 +203,9 @@ def norm(s: Any) -> str:
 
 def norm_mode(v: Any) -> str:
     s = norm(v)
-    if s in {"rent","аренда","long","long-term","долгосрочно","longterm"}: return "rent"
-    if s in {"sale","продажа","buy","sell"}: return "sale"
-    if s in {"daily","посуточно","sutki","сутки","short","short-term","day"}: return "daily"
+    if s in {"rent","аренда","long","long-term","долгосрочно","longterm","🏘 аренда","🏘 rent","🏘 ქირავდება"}: return "rent"
+    if s in {"sale","продажа","buy","sell","🏠 продажа","🏠 sale","🏠 იყიდება"}: return "sale"
+    if s in {"daily","посуточно","sutki","сутки","short","short-term","day","🕓 посуточно 🆕","🕓 daily rent 🆕","🕓 დღიურად 🆕"}: return "daily"
     return ""
 
 def drive_direct(url: str) -> str:
@@ -345,7 +344,6 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
             except Exception:
                 return False
         if q.get("price"):
-            # q["price"] could be a range like "35000$-50000$" or "35000$-"
             try:
                 pr = str(q["price"])
                 if "-" in pr:
@@ -354,12 +352,10 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
                     right_val = float(re.sub(r"[^\d]", "", right) or "0")
                     p = float(re.sub(r"[^\d.]", "", str(r.get("price","")) or "0") or 0)
                     if right_val==0:
-                        # left and above
                         if p < left_val: return False
                     else:
                         if p < left_val or p > right_val: return False
                 else:
-                    # exact numeric cap
                     cap = float(re.sub(r"[^\d.]", "", pr) or "0")
                     p = float(re.sub(r"[^\d.]", "", str(r.get("price","")) or "0") or 0)
                     if p > cap: return False
@@ -407,21 +403,24 @@ async def cmd_refresh(message: types.Message):
     await message.answer(f"♻️ Перезагружено. В кэше: {len(rows)} строк.")
 
 # ---------- Start search flow (Wizard) ----------
-@dp.message(F.text == T["btn_search"]["ru"])
-@dp.message(F.text == T["btn_search"]["en"])
-@dp.message(F.text == T["btn_search"]["ka"])
+@dp.message(F.text.in_([T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"]]))
 @dp.message(Command("search"))
 async def start_search(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(Wizard.mode)
-    # aiogram 3.x requires keyboard kw when creating ReplyKeyboardMarkup
-    kb = ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
-    kb.add(KeyboardButton(T["btn_rent"][current_lang(message.from_user.id)]))
-    kb.add(KeyboardButton(T["btn_sale"][current_lang(message.from_user.id)]))
-    kb.add(KeyboardButton(T["btn_daily"][current_lang(message.from_user.id)]))
+    lang = current_lang(message.from_user.id)
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=T["btn_rent"][lang])],
+            [KeyboardButton(text=T["btn_sale"][lang])],
+            [KeyboardButton(text=T["btn_daily"][lang])]
+        ],
+        resize_keyboard=True
+    )
     await message.answer("Выберите режим: rent / sale / daily", reply_markup=kb)
 
-@dp.message(F.state == Wizard.mode)
+@dp.message(Wizard.mode)
 async def pick_city_mode(message: types.Message, state: FSMContext):
     mode = norm_mode(message.text)
     if not mode:
@@ -431,28 +430,35 @@ async def pick_city_mode(message: types.Message, state: FSMContext):
     rows = await rows_async()
     city_counter = Counter([str(r.get("city","")).strip() for r in rows if r.get("city")])
     buttons = []
-    # sort by name, but we want stable deterministic order
     for city, count in sorted(city_counter.items(), key=lambda x: (-x[1], x[0].lower())):
         icon = CITY_ICONS.get(norm(city), "🏠")
         label = f"{icon} {city} ({count})"
-        buttons.append([KeyboardButton(label)])
+        buttons.append([KeyboardButton(text=label)])
     if not buttons:
-        buttons = [[KeyboardButton("Пропустить")]]
-    kb = ReplyKeyboardMarkup(keyboard=buttons[:40] + [[KeyboardButton("Пропустить")]], resize_keyboard=True)
+        buttons = [[KeyboardButton(text="Пропустить")]]
+    else:
+        buttons.append([KeyboardButton(text="Пропустить")])
+    
+    kb = ReplyKeyboardMarkup(keyboard=buttons[:41], resize_keyboard=True)
     await state.set_state(Wizard.city)
     await message.answer("Выберите город:", reply_markup=kb)
 
-@dp.message(F.state == Wizard.city)
+@dp.message(Wizard.city)
 async def pick_district(message: types.Message, state: FSMContext):
     city_text = message.text.strip()
     if city_text.lower() == "пропустить":
         await state.update_data(city="")
-        # move directly to rooms/price selection
-        await state.set_state(Wizard.district)
-        await pick_price_prompt(message, state)
+        await state.set_state(Wizard.rooms)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
+                [KeyboardButton(text="4"), KeyboardButton(text="5+"), KeyboardButton(text="Пропустить")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer("Выберите количество комнат (1,2,3,4,5+ или Пропустить):", reply_markup=kb)
         return
 
-    # extract name (remove icon and (count))
     city = re.sub(r"^\s*[^\w\dА-Яа-яЁёA-Za-z]+","", city_text)
     city = re.sub(r"\(\d+\)\s*$","", city).strip()
     await state.update_data(city=city)
@@ -460,19 +466,25 @@ async def pick_district(message: types.Message, state: FSMContext):
     rows = await rows_async()
     district_counter = Counter([str(r.get("district","")).strip() for r in rows if norm(r.get("city")) == norm(city) and r.get("district")])
     if not district_counter:
-        # no districts -> skip
         await state.update_data(district="")
-        await state.set_state(Wizard.district)
-        await pick_price_prompt(message, state)
+        await state.set_state(Wizard.rooms)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
+                [KeyboardButton(text="4"), KeyboardButton(text="5+"), KeyboardButton(text="Пропустить")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer("Выберите количество комнат (1,2,3,4,5+ или Пропустить):", reply_markup=kb)
         return
 
-    buttons = [[KeyboardButton(f"{d} ({c})")] for d,c in sorted(district_counter.items(), key=lambda x:(-x[1], x[0].lower()))]
-    buttons.append([KeyboardButton("Пропустить")])
-    kb = ReplyKeyboardMarkup(keyboard=buttons[:40], resize_keyboard=True)
+    buttons = [[KeyboardButton(text=f"{d} ({c})")] for d,c in sorted(district_counter.items(), key=lambda x:(-x[1], x[0].lower()))]
+    buttons.append([KeyboardButton(text="Пропустить")])
+    kb = ReplyKeyboardMarkup(keyboard=buttons[:41], resize_keyboard=True)
     await state.set_state(Wizard.district)
     await message.answer("Выберите район (или Пропустить):", reply_markup=kb)
 
-@dp.message(F.state == Wizard.district)
+@dp.message(Wizard.district)
 async def pick_rooms_or_price(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text.lower() == "пропустить":
@@ -481,255 +493,26 @@ async def pick_rooms_or_price(message: types.Message, state: FSMContext):
         district = re.sub(r"\(\d+\)\s*$","", text).strip()
         await state.update_data(district=district)
 
-    # ask rooms
     await state.set_state(Wizard.rooms)
-    kb = ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
-    kb.add(KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3"))
-    kb.add(KeyboardButton("4"), KeyboardButton("5+"), KeyboardButton("Пропустить"))
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
+            [KeyboardButton(text="4"), KeyboardButton(text="5+"), KeyboardButton(text="Пропустить")]
+        ],
+        resize_keyboard=True
+    )
     await message.answer("Выберите количество комнат (1,2,3,4,5+ или Пропустить):", reply_markup=kb)
 
-@dp.message(F.state == Wizard.rooms)
+@dp.message(Wizard.rooms)
 async def pick_price_prompt(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text.lower() in {"пропустить","весь город","весь район"}:
         await state.update_data(rooms="")
     else:
-        # normalize studio -> 0.5, 5+ -> 5+
         val = text.strip().lower()
         if val=="студия":
             val = "0.5"
         await state.update_data(rooms=val)
 
     data = await state.get_data()
-    mode = data.get("mode","sale")
-    # price selection based on mode
-    ranges = PRICE_RANGES.get(mode, PRICE_RANGES["sale"])
-    buttons = [[KeyboardButton(p)] for p in ranges]
-    buttons.append([KeyboardButton("Пропустить")])
-    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-    await state.set_state(Wizard.price)
-    await message.answer("Выберите ценовой диапазон или Пропустить:", reply_markup=kb)
-
-@dp.message(F.state == Wizard.price)
-async def show_results_handler(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text.lower() == "пропустить":
-        price = ""
-    else:
-        price = text
-
-    data = await state.get_data()
-    await state.update_data(price=price)
-    query = {
-        "mode": data.get("mode"),
-        "city": data.get("city",""),
-        "district": data.get("district",""),
-        "rooms": data.get("rooms",""),
-        "price": price
-    }
-
-    rows = _filter_rows(await rows_async(), query)
-    USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
-    if not rows:
-        await message.answer("Ничего не найдено по вашим параметрам.", reply_markup=main_menu(current_lang(message.from_user.id)))
-        await state.clear()
-        return
-
-    await send_page(message.chat.id, message.from_user.id, 0)
-    await state.clear()
-
-# ------ send_page / navigation ------
-async def send_page(chat_id: int, uid: int, page: int):
-    bundle = USER_RESULTS.get(uid)
-    if not bundle:
-        await bot.send_message(chat_id, "Список пуст.", reply_markup=main_menu(current_lang(uid)))
-        return
-    rows = bundle["rows"]
-    if not rows:
-        await bot.send_message(chat_id, "Нет объявлений.", reply_markup=main_menu(current_lang(uid)))
-        return
-    page = max(0, min(page, (len(rows)-1)//PAGE_SIZE))
-    bundle["page"] = page
-    chunk = _slice(rows, page, PAGE_SIZE)
-
-    for r in chunk:
-        photos = collect_photos(r)
-        text = format_card(r, current_lang(uid))
-        if photos:
-            # send as media group (Telegram requires caption on first)
-            media = [InputMediaPhoto(media=photos[0], caption=text)]
-            for p in photos[1:]:
-                media.append(InputMediaPhoto(media=p))
-            try:
-                await bot.send_media_group(chat_id, media)
-            except Exception:
-                await bot.send_message(chat_id, text)
-        else:
-            await bot.send_message(chat_id, text)
-        await asyncio.sleep(0.12)
-
-    # navigation inline keyboard
-    total_pages = (len(rows)-1)//PAGE_SIZE + 1
-    nav = InlineKeyboardMarkup(row_width=3)
-    nav_buttons = []
-    nav_buttons.append(InlineKeyboardButton(text=T["btn_prev"][current_lang(uid)], callback_data="nav:prev"))
-    nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
-    nav_buttons.append(InlineKeyboardButton(text=T["btn_next"][current_lang(uid)], callback_data="nav:next"))
-    nav.row(*nav_buttons)
-    # favorites / like row
-    nav.add(InlineKeyboardButton(text=T["btn_fav_add"][current_lang(uid)], callback_data="fav:add"),
-            InlineKeyboardButton(text=T["btn_like"][current_lang(uid)], callback_data="like"),
-            InlineKeyboardButton(text=T["btn_dislike"][current_lang(uid)], callback_data="dislike"))
-    await bot.send_message(chat_id, "Навигация:", reply_markup=nav)
-    # maybe ad
-    await maybe_show_ad_by_chat(chat_id, uid)
-
-@dp.callback_query(F.data.startswith("nav:"))
-async def cb_nav(cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    bundle = USER_RESULTS.get(uid)
-    if not bundle:
-        await cb.answer("Список пуст.")
-        return
-    page = bundle.get("page", 0)
-    if cb.data == "nav:prev":
-        page -= 1
-    elif cb.data == "nav:next":
-        page += 1
-    page = max(0, min(page, (len(bundle["rows"])-1)//PAGE_SIZE))
-    await cb.answer()
-    await send_page(cb.message.chat.id, uid, page)
-
-@dp.callback_query(F.data == "noop")
-async def cb_noop(cb: types.CallbackQuery):
-    await cb.answer()
-
-# ------ Like / Dislike / Favorites callbacks ------
-@dp.callback_query(F.data == "like")
-async def cb_like(cb: types.CallbackQuery):
-    await cb.answer("Спасибо! 👍")
-    # Here you can record analytics
-
-@dp.callback_query(F.data == "dislike")
-async def cb_dislike(cb: types.CallbackQuery):
-    await cb.answer("Учтём ваш отзыв 👎")
-
-@dp.callback_query(F.data.startswith("fav:"))
-async def cb_fav(cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    payload = cb.data.split(":")[1]
-    if payload == "add":
-        # Determine current ad id - tricky: we don't have single ad id in nav; for demonstration we'll toggle a placeholder
-        # In production store ad_id in message or callback_data; here we add a marker
-        USER_FAVS[uid].append("manual_fav_placeholder")
-        await cb.answer("Добавлено в избранное")
-    elif payload == "del":
-        if USER_FAVS[uid]:
-            USER_FAVS[uid].pop()
-        await cb.answer("Удалено из избранного")
-    else:
-        await cb.answer()
-
-# ------ Generic handlers for language and menu ------
-@dp.message(F.text == T["btn_language"]["ru"])
-@dp.message(F.text == T["btn_language"]["en"])
-@dp.message(F.text == T["btn_language"]["ka"])
-async def choose_language(message: types.Message):
-    kb = InlineKeyboardMarkup(row_width=3)
-    for l in LANGS:
-        kb.add(InlineKeyboardButton(text=l.upper(), callback_data=f"lang:{l}"))
-    await message.answer("Выберите язык / Choose language / ენა", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("lang:"))
-async def cb_set_lang(cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    lang = cb.data.split(":")[1]
-    USER_LANG[uid] = lang
-    await cb.answer(f"Язык установлен: {lang.upper()}")
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-    await cb.message.answer("Меню:", reply_markup=main_menu(lang))
-
-@dp.message(F.text == T["btn_fast"]["ru"])
-@dp.message(F.text == T["btn_fast"]["en"])
-@dp.message(F.text == T["btn_fast"]["ka"])
-async def quick_pick_entry(msg: types.Message, state: FSMContext):
-    # Quick pick - a simplified variant: ask mode then show top N newest
-    await state.clear()
-    await state.set_state(Wizard.mode)
-    # aiogram 3.x requires keyboard kw when creating ReplyKeyboardMarkup
-    kb = ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
-    kb.add(KeyboardButton(T["btn_rent"][current_lang(msg.from_user.id)]))
-    kb.add(KeyboardButton(T["btn_sale"][current_lang(msg.from_user.id)]))
-    kb.add(KeyboardButton(T["btn_daily"][current_lang(msg.from_user.id)]))
-    await msg.answer("Выберите режим для быстрого подбора:", reply_markup=kb)
-
-# catch-all to avoid "not handled"
-@dp.message()
-async def fallback_all(message: types.Message, state: FSMContext):
-    # Provide helpful hint instead of ignoring updates
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Я получил сообщение, но оно пустое или не текстовое.")
-        return
-    # If user typed something like 'Тбилиси (12)' while in Wizard.city, FSM handlers handle; else help:
-    await message.answer("Если хотите начать поиск — нажмите '🔎 Поиск' или '🟢 Быстрый подбор' в меню.", reply_markup=main_menu(current_lang(message.from_user.id)))
-
-# ------ Analytics / Heartbeat ------
-ANALYTIC_EVENTS: List[Dict[str, Any]] = []
-AGG_BY_DAY = defaultdict(lambda: Counter())
-
-def _today_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d")
-
-def log_event(event: str, uid: int):
-    day = _today_str()
-    ANALYTIC_EVENTS.append({"event": event, "uid": uid, "day": day, "ts": datetime.utcnow().isoformat(timespec="seconds")})
-    AGG_BY_DAY[day][event] += 1
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    if message.from_user.id != Config.ADMIN_CHAT_ID:
-        return
-    d = _today_str()
-    c = AGG_BY_DAY[d]
-    await message.answer(f"📊 Сегодня: search={c['search']}, view={c['view']}, leads={c['lead']}")
-
-async def heartbeat():
-    while True:
-        try:
-            logger.info("Heartbeat OK")
-        except Exception:
-            logger.exception("Heartbeat error")
-        await asyncio.sleep(600)
-
-# ------ Startup / Shutdown ------
-async def startup():
-    await rows_async(force=True)
-    if Config.ADMIN_CHAT_ID:
-        try:
-            await bot.send_message(Config.ADMIN_CHAT_ID, "🤖 LivePlace bot started (Sheets enabled)")
-        except Exception:
-            pass
-    asyncio.create_task(heartbeat())
-    logger.info("LivePlace bot starting…")
-
-async def shutdown():
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
-    logger.info("Bot shutdown complete")
-
-# ------ Main ------
-async def main():
-    try:
-        await startup()
-        await dp.start_polling(bot, skip_updates=True)
-    finally:
-        await shutdown()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    mode = data.get("mode","sale
