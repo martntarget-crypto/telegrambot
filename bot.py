@@ -56,6 +56,7 @@ except Exception:
 class Config:
     API_TOKEN = os.getenv("API_TOKEN", "").strip()
     ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
+    FEEDBACK_CHANNEL = os.getenv("FEEDBACK_CHANNEL", "@LivePlaceFeedback").strip()  # Канал для лидов
     SHEETS_ENABLED = os.getenv("SHEETS_ENABLED", "1").strip() not in {"", "0", "false", "False"}
     GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
     GSHEET_TAB = os.getenv("GSHEET_TAB", "Ads").strip()
@@ -293,7 +294,10 @@ class Wizard(StatesGroup):
 # ------ User data ------
 PAGE_SIZE = 8
 USER_RESULTS: Dict[int, Dict[str, Any]] = {}
-USER_FAVS: Dict[int, List[str]] = defaultdict(list)
+USER_FAVS: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+USER_CURRENT_INDEX: Dict[int, int] = {}
+USER_LEAD_STATE: Dict[int, str] = {}  # "awaiting_name" or "awaiting_phone"
+USER_LEAD_DATA: Dict[int, Dict[str, Any]] = {}
 LAST_AD_TIME: Dict[int, float] = {}
 LAST_AD_ID: Dict[int, str] = {}
 
@@ -543,15 +547,76 @@ async def show_results_handler(message: types.Message, state: FSMContext):
 
     rows = _filter_rows(await rows_async(), query)
     USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
+    USER_CURRENT_INDEX[message.from_user.id] = 0
+    
     if not rows:
         await message.answer("Ничего не найдено по вашим параметрам.", reply_markup=main_menu(current_lang(message.from_user.id)))
         await state.clear()
         return
 
-    await send_page(message.chat.id, message.from_user.id, 0)
+    await show_single_ad(message.chat.id, message.from_user.id)
     await state.clear()
 
-# ------ send_page / navigation ------
+# ------ Show single ad with interaction buttons ------
+async def show_single_ad(chat_id: int, uid: int):
+    bundle = USER_RESULTS.get(uid)
+    if not bundle:
+        await bot.send_message(chat_id, "Список пуст.", reply_markup=main_menu(current_lang(uid)))
+        return
+    
+    rows = bundle["rows"]
+    if not rows:
+        await bot.send_message(chat_id, "Нет объявлений.", reply_markup=main_menu(current_lang(uid)))
+        return
+    
+    current_index = USER_CURRENT_INDEX.get(uid, 0)
+    
+    if current_index >= len(rows):
+        await bot.send_message(
+            chat_id, 
+            "Вы просмотрели все объявления! 🎉\n\nВыберите действие:",
+            reply_markup=main_menu(current_lang(uid))
+        )
+        return
+    
+    row = rows[current_index]
+    photos = collect_photos(row)
+    text = format_card(row, current_lang(uid))
+    text += f"\n\n📊 Объявление {current_index + 1} из {len(rows)}"
+    
+    # Inline кнопки для взаимодействия
+    buttons = [
+        [
+            InlineKeyboardButton(text="❤️ Нравится", callback_data=f"like:{current_index}"),
+            InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"dislike:{current_index}")
+        ],
+        [
+            InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_add:{current_index}")
+        ]
+    ]
+    
+    # Проверяем, есть ли уже в избранном
+    if any(fav.get("index") == current_index for fav in USER_FAVS.get(uid, [])):
+        buttons[1] = [InlineKeyboardButton(text="⭐ Удалить из избранного", callback_data=f"fav_del:{current_index}")]
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    # Отправляем фото или текст
+    if photos:
+        media = [InputMediaPhoto(media=photos[0], caption=text)]
+        for p in photos[1:]:
+            media.append(InputMediaPhoto(media=p))
+        try:
+            msgs = await bot.send_media_group(chat_id, media)
+            # Отправляем кнопки отдельным сообщением
+            await bot.send_message(chat_id, "Выберите действие:", reply_markup=kb)
+        except Exception as e:
+            logger.error(f"Error sending media group: {e}")
+            await bot.send_message(chat_id, text, reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, text, reply_markup=kb)
+
+# ------ send_page / navigation (OLD - keep for compatibility) ------
 async def send_page(chat_id: int, uid: int, page: int):
     bundle = USER_RESULTS.get(uid)
     if not bundle:
@@ -618,27 +683,182 @@ async def cb_noop(cb: types.CallbackQuery):
     await cb.answer()
 
 # ------ Like / Dislike / Favorites callbacks ------
-@dp.callback_query(F.data == "like")
+@dp.callback_query(F.data.startswith("like:"))
 async def cb_like(cb: types.CallbackQuery):
-    await cb.answer("Спасибо! 👍")
-
-@dp.callback_query(F.data == "dislike")
-async def cb_dislike(cb: types.CallbackQuery):
-    await cb.answer("Учтём ваш отзыв 👎")
-
-@dp.callback_query(F.data.startswith("fav:"))
-async def cb_fav(cb: types.CallbackQuery):
     uid = cb.from_user.id
-    payload = cb.data.split(":")[1]
-    if payload == "add":
-        USER_FAVS[uid].append("manual_fav_placeholder")
-        await cb.answer("Добавлено в избранное")
-    elif payload == "del":
-        if USER_FAVS[uid]:
-            USER_FAVS[uid].pop()
-        await cb.answer("Удалено из избранного")
+    index = int(cb.data.split(":")[1])
+    
+    bundle = USER_RESULTS.get(uid)
+    if not bundle or index >= len(bundle["rows"]):
+        await cb.answer("Ошибка: объявление не найдено")
+        return
+    
+    row = bundle["rows"][index]
+    
+    # Сохраняем информацию для лида
+    USER_LEAD_DATA[uid] = {
+        "ad_index": index,
+        "ad_data": row,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    USER_LEAD_STATE[uid] = "awaiting_name"
+    
+    await cb.answer("Отлично! 👍")
+    await cb.message.answer(
+        "📝 <b>Оставьте заявку</b>\n\n"
+        "Мы свяжемся с вами в ближайшее время!\n\n"
+        "Пожалуйста, напишите ваше <b>имя</b>:"
+    )
+
+@dp.callback_query(F.data.startswith("dislike:"))
+async def cb_dislike(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    index = int(cb.data.split(":")[1])
+    
+    # Переход к следующему объявлению
+    USER_CURRENT_INDEX[uid] = index + 1
+    
+    await cb.answer("Понятно 👎")
+    await show_single_ad(cb.message.chat.id, uid)
+
+@dp.callback_query(F.data.startswith("fav_add:"))
+async def cb_fav_add(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    index = int(cb.data.split(":")[1])
+    
+    bundle = USER_RESULTS.get(uid)
+    if not bundle or index >= len(bundle["rows"]):
+        await cb.answer("Ошибка: объявление не найдено")
+        return
+    
+    row = bundle["rows"][index]
+    
+    # Проверяем, не добавлено ли уже
+    if not any(fav.get("index") == index for fav in USER_FAVS[uid]):
+        USER_FAVS[uid].append({"index": index, "data": row})
+        await cb.answer("⭐ Добавлено в избранное!")
+        
+        # Обновляем кнопки
+        buttons = [
+            [
+                InlineKeyboardButton(text="❤️ Нравится", callback_data=f"like:{index}"),
+                InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"dislike:{index}")
+            ],
+            [
+                InlineKeyboardButton(text="⭐ Удалить из избранного", callback_data=f"fav_del:{index}")
+            ]
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
     else:
-        await cb.answer()
+        await cb.answer("Уже в избранном!")
+
+@dp.callback_query(F.data.startswith("fav_del:"))
+async def cb_fav_del(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    index = int(cb.data.split(":")[1])
+    
+    # Удаляем из избранного
+    USER_FAVS[uid] = [fav for fav in USER_FAVS[uid] if fav.get("index") != index]
+    await cb.answer("Удалено из избранного")
+    
+    # Обновляем кнопки
+    buttons = [
+        [
+            InlineKeyboardButton(text="❤️ Нравится", callback_data=f"like:{index}"),
+            InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"dislike:{index}")
+        ],
+        [
+            InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_add:{index}")
+        ]
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+# ------ Lead form handlers ------
+@dp.message(F.text)
+async def handle_lead_form(message: types.Message):
+    uid = message.from_user.id
+    
+    # Проверяем, ожидается ли ввод данных для заявки
+    if uid not in USER_LEAD_STATE:
+        return
+    
+    state = USER_LEAD_STATE[uid]
+    
+    if state == "awaiting_name":
+        # Сохраняем имя
+        USER_LEAD_DATA[uid]["name"] = message.text.strip()
+        USER_LEAD_STATE[uid] = "awaiting_phone"
+        
+        await message.answer(
+            "Отлично! Теперь укажите ваш <b>номер телефона</b>:\n"
+            "(например: +995 555 123 456)"
+        )
+        
+    elif state == "awaiting_phone":
+        # Сохраняем телефон
+        USER_LEAD_DATA[uid]["phone"] = message.text.strip()
+        
+        # Отправляем лид в канал
+        await send_lead_to_channel(uid)
+        
+        # Очищаем состояние
+        del USER_LEAD_STATE[uid]
+        lead_data = USER_LEAD_DATA.pop(uid)
+        
+        await message.answer(
+            "✅ <b>Спасибо!</b> Ваша заявка принята.\n\n"
+            "Мы свяжемся с вами в ближайшее время! 📞",
+            reply_markup=main_menu(current_lang(uid))
+        )
+        
+        # Переход к следующему объявлению
+        current_index = lead_data.get("ad_index", 0)
+        USER_CURRENT_INDEX[uid] = current_index + 1
+        
+        await asyncio.sleep(1)
+        await show_single_ad(message.chat.id, uid)
+
+async def send_lead_to_channel(uid: int):
+    """Отправка лида в Telegram канал"""
+    if uid not in USER_LEAD_DATA:
+        return
+    
+    lead = USER_LEAD_DATA[uid]
+    ad = lead.get("ad_data", {})
+    
+    # Формируем сообщение для канала
+    text = (
+        "🔥 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+        f"👤 <b>Имя:</b> {lead.get('name', 'Не указано')}\n"
+        f"📱 <b>Телефон:</b> {lead.get('phone', 'Не указано')}\n"
+        f"🆔 <b>User ID:</b> {uid}\n\n"
+        f"<b>Интересующее объявление:</b>\n"
+        f"🏠 {ad.get('title_ru', 'Без названия')}\n"
+        f"📍 {ad.get('city', '')} {ad.get('district', '')}\n"
+        f"💰 {ad.get('price', 'Не указана')}\n"
+        f"☎️ Телефон владельца: {ad.get('phone', 'Не указан')}\n\n"
+        f"⏰ {lead.get('timestamp', '')}"
+    )
+    
+    try:
+        await bot.send_message(Config.FEEDBACK_CHANNEL, text)
+        logger.info(f"Lead sent to channel for user {uid}")
+    except Exception as e:
+        logger.error(f"Failed to send lead to channel: {e}")
+        # Отправляем админу, если канал недоступен
+        if Config.ADMIN_CHAT_ID:
+            try:
+                await bot.send_message(Config.ADMIN_CHAT_ID, f"⚠️ Ошибка отправки лида в канал:\n\n{text}")
+            except Exception:
+                pass
 
 # ------ Generic handlers for language and menu ------
 @dp.message(F.text.in_([T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"]]))
@@ -662,19 +882,18 @@ async def cb_set_lang(cb: types.CallbackQuery):
 
 @dp.message(F.text.in_([T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"]]))
 async def quick_pick_entry(msg: types.Message, state: FSMContext):
-    await state.clear()
-    await state.set_state(Wizard.mode)
-    lang = current_lang(msg.from_user.id)
+    # Быстрый подбор - показываем топ-20 новых объявлений
+    rows = await rows_async()
+    if not rows:
+        await msg.answer("Нет доступных объявлений.")
+        return
     
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=T["btn_rent"][lang])],
-            [KeyboardButton(text=T["btn_sale"][lang])],
-            [KeyboardButton(text=T["btn_daily"][lang])]
-        ],
-        resize_keyboard=True
-    )
-    await msg.answer("Выберите режим для быстрого подбора:", reply_markup=kb)
+    sorted_rows = sorted(rows, key=lambda x: str(x.get("published", "")), reverse=True)[:20]
+    USER_RESULTS[msg.from_user.id] = {"query": {}, "rows": sorted_rows, "page": 0}
+    USER_CURRENT_INDEX[msg.from_user.id] = 0
+    
+    await msg.answer("🟢 <b>Быстрый подбор</b>\n\nПоказываю лучшие новые объявления:")
+    await show_single_ad(msg.chat.id, msg.from_user.id)
 
 @dp.message(F.text.in_([T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"]]))
 async def show_favorites(message: types.Message):
@@ -683,7 +902,11 @@ async def show_favorites(message: types.Message):
     if not favs:
         await message.answer("У вас пока нет избранных объявлений.")
     else:
-        await message.answer(f"У вас {len(favs)} избранных объявлений.")
+        # Показываем список избранного
+        USER_RESULTS[uid] = {"query": {}, "rows": [f["data"] for f in favs], "page": 0}
+        USER_CURRENT_INDEX[uid] = 0
+        await message.answer(f"У вас {len(favs)} избранных объявлений:")
+        await show_single_ad(message.chat.id, uid)
 
 @dp.message(F.text.in_([T["btn_latest"]["ru"], T["btn_latest"]["en"], T["btn_latest"]["ka"]]))
 async def show_latest(message: types.Message):
@@ -692,9 +915,10 @@ async def show_latest(message: types.Message):
         await message.answer("Нет доступных объявлений.")
         return
     
-    sorted_rows = sorted(rows, key=lambda x: str(x.get("published", "")), reverse=True)[:10]
+    sorted_rows = sorted(rows, key=lambda x: str(x.get("published", "")), reverse=True)[:20]
     USER_RESULTS[message.from_user.id] = {"query": {}, "rows": sorted_rows, "page": 0}
-    await send_page(message.chat.id, message.from_user.id, 0)
+    USER_CURRENT_INDEX[message.from_user.id] = 0
+    await show_single_ad(message.chat.id, message.from_user.id)
 
 @dp.message(F.text.in_([T["btn_about"]["ru"], T["btn_about"]["en"], T["btn_about"]["ka"]]))
 async def show_about(message: types.Message):
@@ -709,6 +933,13 @@ async def show_menu(message: types.Message):
 # catch-all to avoid "not handled"
 @dp.message()
 async def fallback_all(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    
+    # Проверяем, ожидается ли ввод для заявки
+    if uid in USER_LEAD_STATE:
+        await handle_lead_form(message)
+        return
+    
     text = (message.text or "").strip()
     if not text:
         await message.answer("Я получил сообщение, но оно пустое или не текстовое.")
