@@ -515,4 +515,259 @@ async def pick_price_prompt(message: types.Message, state: FSMContext):
         await state.update_data(rooms=val)
 
     data = await state.get_data()
-    mode = data.get("mode","sale
+    mode = data.get("mode","sale")
+    ranges = PRICE_RANGES.get(mode, PRICE_RANGES["sale"])
+    buttons = [[KeyboardButton(text=p)] for p in ranges]
+    buttons.append([KeyboardButton(text="Пропустить")])
+    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    await state.set_state(Wizard.price)
+    await message.answer("Выберите ценовой диапазон или Пропустить:", reply_markup=kb)
+
+@dp.message(Wizard.price)
+async def show_results_handler(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text.lower() == "пропустить":
+        price = ""
+    else:
+        price = text
+
+    data = await state.get_data()
+    await state.update_data(price=price)
+    query = {
+        "mode": data.get("mode"),
+        "city": data.get("city",""),
+        "district": data.get("district",""),
+        "rooms": data.get("rooms",""),
+        "price": price
+    }
+
+    rows = _filter_rows(await rows_async(), query)
+    USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
+    if not rows:
+        await message.answer("Ничего не найдено по вашим параметрам.", reply_markup=main_menu(current_lang(message.from_user.id)))
+        await state.clear()
+        return
+
+    await send_page(message.chat.id, message.from_user.id, 0)
+    await state.clear()
+
+# ------ send_page / navigation ------
+async def send_page(chat_id: int, uid: int, page: int):
+    bundle = USER_RESULTS.get(uid)
+    if not bundle:
+        await bot.send_message(chat_id, "Список пуст.", reply_markup=main_menu(current_lang(uid)))
+        return
+    rows = bundle["rows"]
+    if not rows:
+        await bot.send_message(chat_id, "Нет объявлений.", reply_markup=main_menu(current_lang(uid)))
+        return
+    page = max(0, min(page, (len(rows)-1)//PAGE_SIZE))
+    bundle["page"] = page
+    chunk = _slice(rows, page, PAGE_SIZE)
+
+    for r in chunk:
+        photos = collect_photos(r)
+        text = format_card(r, current_lang(uid))
+        if photos:
+            media = [InputMediaPhoto(media=photos[0], caption=text)]
+            for p in photos[1:]:
+                media.append(InputMediaPhoto(media=p))
+            try:
+                await bot.send_media_group(chat_id, media)
+            except Exception:
+                await bot.send_message(chat_id, text)
+        else:
+            await bot.send_message(chat_id, text)
+        await asyncio.sleep(0.12)
+
+    total_pages = (len(rows)-1)//PAGE_SIZE + 1
+    nav_buttons = [
+        [
+            InlineKeyboardButton(text=T["btn_prev"][current_lang(uid)], callback_data="nav:prev"),
+            InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"),
+            InlineKeyboardButton(text=T["btn_next"][current_lang(uid)], callback_data="nav:next")
+        ],
+        [
+            InlineKeyboardButton(text=T["btn_fav_add"][current_lang(uid)], callback_data="fav:add"),
+            InlineKeyboardButton(text=T["btn_like"][current_lang(uid)], callback_data="like"),
+            InlineKeyboardButton(text=T["btn_dislike"][current_lang(uid)], callback_data="dislike")
+        ]
+    ]
+    nav = InlineKeyboardMarkup(inline_keyboard=nav_buttons)
+    await bot.send_message(chat_id, "Навигация:", reply_markup=nav)
+    await maybe_show_ad_by_chat(chat_id, uid)
+
+@dp.callback_query(F.data.startswith("nav:"))
+async def cb_nav(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    bundle = USER_RESULTS.get(uid)
+    if not bundle:
+        await cb.answer("Список пуст.")
+        return
+    page = bundle.get("page", 0)
+    if cb.data == "nav:prev":
+        page -= 1
+    elif cb.data == "nav:next":
+        page += 1
+    page = max(0, min(page, (len(bundle["rows"])-1)//PAGE_SIZE))
+    await cb.answer()
+    await send_page(cb.message.chat.id, uid, page)
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(cb: types.CallbackQuery):
+    await cb.answer()
+
+# ------ Like / Dislike / Favorites callbacks ------
+@dp.callback_query(F.data == "like")
+async def cb_like(cb: types.CallbackQuery):
+    await cb.answer("Спасибо! 👍")
+
+@dp.callback_query(F.data == "dislike")
+async def cb_dislike(cb: types.CallbackQuery):
+    await cb.answer("Учтём ваш отзыв 👎")
+
+@dp.callback_query(F.data.startswith("fav:"))
+async def cb_fav(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    payload = cb.data.split(":")[1]
+    if payload == "add":
+        USER_FAVS[uid].append("manual_fav_placeholder")
+        await cb.answer("Добавлено в избранное")
+    elif payload == "del":
+        if USER_FAVS[uid]:
+            USER_FAVS[uid].pop()
+        await cb.answer("Удалено из избранного")
+    else:
+        await cb.answer()
+
+# ------ Generic handlers for language and menu ------
+@dp.message(F.text.in_([T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"]]))
+async def choose_language(message: types.Message):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=l.upper(), callback_data=f"lang:{l}")] for l in LANGS]
+    )
+    await message.answer("Выберите язык / Choose language / ენა", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def cb_set_lang(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    lang = cb.data.split(":")[1]
+    USER_LANG[uid] = lang
+    await cb.answer(f"Язык установлен: {lang.upper()}")
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer("Меню:", reply_markup=main_menu(lang))
+
+@dp.message(F.text.in_([T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"]]))
+async def quick_pick_entry(msg: types.Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(Wizard.mode)
+    lang = current_lang(msg.from_user.id)
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=T["btn_rent"][lang])],
+            [KeyboardButton(text=T["btn_sale"][lang])],
+            [KeyboardButton(text=T["btn_daily"][lang])]
+        ],
+        resize_keyboard=True
+    )
+    await msg.answer("Выберите режим для быстрого подбора:", reply_markup=kb)
+
+@dp.message(F.text.in_([T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"]]))
+async def show_favorites(message: types.Message):
+    uid = message.from_user.id
+    favs = USER_FAVS.get(uid, [])
+    if not favs:
+        await message.answer("У вас пока нет избранных объявлений.")
+    else:
+        await message.answer(f"У вас {len(favs)} избранных объявлений.")
+
+@dp.message(F.text.in_([T["btn_latest"]["ru"], T["btn_latest"]["en"], T["btn_latest"]["ka"]]))
+async def show_latest(message: types.Message):
+    rows = await rows_async()
+    if not rows:
+        await message.answer("Нет доступных объявлений.")
+        return
+    
+    sorted_rows = sorted(rows, key=lambda x: str(x.get("published", "")), reverse=True)[:10]
+    USER_RESULTS[message.from_user.id] = {"query": {}, "rows": sorted_rows, "page": 0}
+    await send_page(message.chat.id, message.from_user.id, 0)
+
+@dp.message(F.text.in_([T["btn_about"]["ru"], T["btn_about"]["en"], T["btn_about"]["ka"]]))
+async def show_about(message: types.Message):
+    lang = current_lang(message.from_user.id)
+    await message.answer(t(lang, "about"))
+
+@dp.message(F.text.in_([T["btn_home"]["ru"], T["btn_home"]["en"], T["btn_home"]["ka"]]))
+async def show_menu(message: types.Message):
+    lang = current_lang(message.from_user.id)
+    await message.answer(T["menu_title"][lang], reply_markup=main_menu(lang))
+
+# catch-all to avoid "not handled"
+@dp.message()
+async def fallback_all(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Я получил сообщение, но оно пустое или не текстовое.")
+        return
+    await message.answer("Если хотите начать поиск — нажмите '🔎 Поиск' или '🟢 Быстрый подбор' в меню.", reply_markup=main_menu(current_lang(message.from_user.id)))
+
+# ------ Analytics / Heartbeat ------
+ANALYTIC_EVENTS: List[Dict[str, Any]] = []
+AGG_BY_DAY = defaultdict(lambda: Counter())
+
+def _today_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def log_event(event: str, uid: int):
+    day = _today_str()
+    ANALYTIC_EVENTS.append({"event": event, "uid": uid, "day": day, "ts": datetime.utcnow().isoformat(timespec="seconds")})
+    AGG_BY_DAY[day][event] += 1
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id != Config.ADMIN_CHAT_ID:
+        return
+    d = _today_str()
+    c = AGG_BY_DAY[d]
+    await message.answer(f"📊 Сегодня: search={c['search']}, view={c['view']}, leads={c['lead']}")
+
+async def heartbeat():
+    while True:
+        try:
+            logger.info("Heartbeat OK")
+        except Exception:
+            logger.exception("Heartbeat error")
+        await asyncio.sleep(600)
+
+# ------ Startup / Shutdown ------
+async def startup():
+    await rows_async(force=True)
+    if Config.ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(Config.ADMIN_CHAT_ID, "🤖 LivePlace bot started (Sheets enabled)")
+        except Exception:
+            pass
+    asyncio.create_task(heartbeat())
+    logger.info("LivePlace bot starting…")
+
+async def shutdown():
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+    logger.info("Bot shutdown complete")
+
+# ------ Main ------
+async def main():
+    try:
+        await startup()
+        await dp.start_polling(bot, skip_updates=True)
+    finally:
+        await shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
