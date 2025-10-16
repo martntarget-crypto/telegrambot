@@ -200,7 +200,11 @@ PRICE_RANGES = {
 
 # ------ Utilities ------
 def norm(s: Any) -> str:
-    return str(s or "").strip().lower()
+    """Нормализация строки для сравнения"""
+    result = str(s or "").strip().lower()
+    # Убираем лишние пробелы
+    result = " ".join(result.split())
+    return result
 
 def norm_mode(v: Any) -> str:
     s = norm(v)
@@ -335,17 +339,25 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
         # Проверяем режим (обязательный параметр)
         if q.get("mode"):
             row_mode = norm_mode(r.get("mode"))
-            if row_mode != q["mode"]:
+            query_mode = q["mode"]
+            logger.debug(f"Mode check: row={row_mode}, query={query_mode}")
+            if row_mode != query_mode:
                 return False
         
         # Проверяем город (только если указан и не пуст)
         if q.get("city") and q["city"].strip():
-            if norm(r.get("city")) != norm(q["city"]):
+            row_city = norm(r.get("city"))
+            query_city = norm(q["city"])
+            logger.debug(f"City check: row='{row_city}', query='{query_city}'")
+            if row_city != query_city:
                 return False
         
         # Проверяем район (только если указан и не пуст)
         if q.get("district") and q["district"].strip():
-            if norm(r.get("district")) != norm(q["district"]):
+            row_district = norm(r.get("district"))
+            query_district = norm(q["district"])
+            logger.debug(f"District check: row='{row_district}', query='{query_district}'")
+            if row_district != query_district:
                 return False
         
         # Проверяем количество комнат (только если указано и не пусто)
@@ -363,8 +375,8 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
                     # Точное совпадение (с учетом студии)
                     if int(need) != int(have) and not (need == 0.5 and have == 0.5):
                         return False
-            except Exception:
-                # Если не удалось распарсить - пропускаем фильтр
+            except Exception as e:
+                logger.debug(f"Rooms parse error: {e}")
                 pass
         
         # Проверяем цену (только если указана и не пуста)
@@ -400,12 +412,18 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
                         return False
             except Exception as e:
                 logger.error(f"Price filter error: {e}")
-                # Если ошибка парсинга цены - не отбрасываем объявление
                 pass
         
         return True
     
     filtered = [r for r in rows if ok(r)]
+    
+    # Логируем первые несколько строк для отладки
+    if len(filtered) == 0 and len(rows) > 0:
+        logger.info("Sample rows for debugging:")
+        for i, r in enumerate(rows[:3]):
+            logger.info(f"Row {i}: mode={r.get('mode')}, city={r.get('city')}, district={r.get('district')}")
+    
     logger.info(f"Filtered {len(filtered)} rows from {len(rows)} total with query: {q}")
     return filtered
 
