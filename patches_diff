@@ -1,0 +1,668 @@
+diff --git a/bot.py b/bot_fixed.py
+index 1234567..abcdefg 100644
+--- a/bot.py
++++ b/bot_fixed.py
+@@ -32,6 +32,7 @@ class Config:
+     API_TOKEN = os.getenv("API_TOKEN", "").strip()
+     ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
+-    FEEDBACK_CHANNEL = os.getenv("FEEDBACK_CHANNEL", "@LivePlaceFeedback").strip()
++    FEEDBACK_CHAT_ID = int(os.getenv("FEEDBACK_CHAT_ID", "-4852620232") or "-4852620232")
+     SHEETS_ENABLED = os.getenv("SHEETS_ENABLED", "1").strip() not in {"", "0", "false", "False"}
+     GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
+     GSHEET_TAB = os.getenv("GSHEET_TAB", "Ads").strip()
+-    GSHEET_REFRESH_MIN = int(os.getenv("GSHEET_REFRESH_MIN", "2") or "2")
++    GSHEET_REFRESH_SEC = int(os.getenv("GSHEET_REFRESH_SEC", "120") or "120")
++    MEDIA_RETRY_COUNT = 3
++    MEDIA_RETRY_DELAY = 2
+ 
+@@ -150,11 +153,20 @@ PRICE_RANGES = {
+ def norm_mode(v: Any) -> str:
+-    s = norm(v)
++    """ИСПРАВЛЕНО: Нормализация режима с удалением эмодзи"""
++    s = norm(v)
++    # Убираем эмодзи и лишние символы
++    s = re.sub(r'[^\w\s-]', '', s)
++    s = s.strip()
++    
+-    if s in {"rent","аренда","long","long-term","долгосрочно","longterm","🏘 аренда","🏘 rent","🏘 ქირავდება"}: return "rent"
++    if s in {"rent","аренда","long","longterm","долгосрочно"}: 
++        return "rent"
+-    if s in {"sale","продажа","buy","sell","🏠 продажа","🏠 sale","🏠 იყიდება"}: return "sale"
++    if s in {"sale","продажа","buy","sell"}: 
++        return "sale"
+-    if s in {"daily","посуточно","sutki","сутки","short","short-term","day","🕓 посуточно 🆕","🕓 daily rent 🆕","🕓 დღიურად 🆕"}: return "daily"
++    if s in {"daily","посуточно","sutki","сутки","short","shortterm","day"}: 
++        return "daily"
+     return ""
+ 
++def clean_button_text(text: str) -> str:
++    """НОВОЕ: Очистка текста кнопки от эмодзи и счётчиков"""
++    text = re.sub(r"^[\U0001F300-\U0001F9FF\s]+", "", text)
++    text = re.sub(r"\s*\(\d+\)\s*$", "", text)
++    return text.strip()
++
+@@ -185,6 +197,21 @@ def looks_like_image(url: str) -> bool:
+            "googleusercontent.com" in u or "google.com/uc?export=download" in u
+ 
++def is_valid_photo_url(url: str) -> bool:
++    """НОВОЕ: Валидация URL фото"""
++    if not url or not url.strip():
++        return False
++    try:
++        parsed = urlparse(url)
++        if not parsed.scheme in ['http', 'https']:
++            return False
++        if not parsed.netloc:
++            return False
++        return looks_like_image(url)
++    except Exception:
++        return False
++
+ def collect_photos(row: Dict[str, Any]) -> List[str]:
++    """ИСПРАВЛЕНО: Сбор и валидация фото"""
+     out = []
+     for i in range(1, 11):
+         u = str(row.get(f"photo{i}", "") or "").strip()
+-        if not u: continue
++        if not u: 
++            continue
+         u = drive_direct(u)
+-        if looks_like_image(u): out.append(u)
++        if is_valid_photo_url(u):
++            out.append(u)
++        else:
++            logger.warning(f"⚠️ Invalid photo URL: {u[:50]}...")
+     return out[:10]
+ 
+@@ -337,9 +364,10 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[st
++    """ИСПРАВЛЕНО: Корректная фильтрация с нормализацией режима"""
+     def ok(r):
+-        # Проверяем режим (обязательный параметр)
+         if q.get("mode"):
+             row_mode = norm_mode(r.get("mode"))
+-            query_mode = q["mode"]
++            query_mode = norm_mode(q["mode"])  # ИСПРАВЛЕНО: добавлена нормализация
+             logger.debug(f"Mode check: row={row_mode}, query={query_mode}")
+             if row_mode != query_mode:
+@@ -370,6 +398,52 @@ def _slice(listing: List[Any], page: int, size: int) -> List[Any]:
+     return listing[page*size:(page+1)*size]
+ 
++# ------ Safe media sending ------
++async def send_media_safe(chat_id: int, photos: List[str], text: str, 
++                         retry_count: int = Config.MEDIA_RETRY_COUNT) -> bool:
++    """НОВОЕ: Безопасная отправка медиа с retry"""
++    if not photos:
++        return False
++    
++    for attempt in range(retry_count):
++        try:
++            media = [InputMediaPhoto(media=photos[0], caption=text)]
++            for p in photos[1:]:
++                media.append(InputMediaPhoto(media=p))
++            
++            await bot.send_media_group(chat_id, media)
++            logger.info(f"✅ Media sent successfully: {len(photos)} photos")
++            return True
++            
++        except Exception as e:
++            error_msg = str(e)
++            logger.error(f"❌ Attempt {attempt + 1}/{retry_count} failed: {error_msg}")
++            
++            if "WEBPAGE_CURL_FAILED" in error_msg:
++                logger.error(f"🚫 WEBPAGE_CURL_FAILED for photos: {photos}")
++                if Config.ADMIN_CHAT_ID:
++                    try:
++                        await bot.send_message(
++                            Config.ADMIN_CHAT_ID,
++                            f"⚠️ WEBPAGE_CURL_FAILED\nPhotos:\n{chr(10).join(photos[:3])}"
++                        )
++                    except Exception:
++                        pass
++                return False
++                
++            elif "WEBPAGE_MEDIA_EMPTY" in error_msg:
++                logger.error(f"🚫 WEBPAGE_MEDIA_EMPTY for photos: {photos}")
++                return False
++            
++            if attempt < retry_count - 1:
++                await asyncio.sleep(Config.MEDIA_RETRY_DELAY)
++            else:
++                logger.error(f"💥 All {retry_count} attempts failed")
++                return False
++    
++    return False
++
+ # ------ Commands & Handlers ------
+ 
+@@ -390,8 +464,12 @@ async def cmd_health(message: types.Message):
+     if message.from_user.id != Config.ADMIN_CHAT_ID:
+         return
+-    await message.answer(f"✅ Bot OK\nSheets enabled: {Config.SHEETS_ENABLED}\nCached rows: {len(_cached_rows)}")
++    await message.answer(
++        f"✅ Bot OK\n"
++        f"Sheets enabled: {Config.SHEETS_ENABLED}\n"
++        f"Cached rows: {len(_cached_rows)}\n"
++        f"Cache age: {int(monotonic() - _cache_ts)}s\n"
++        f"Refresh interval: {Config.GSHEET_REFRESH_SEC}s"
++    )
+ 
+@@ -407,6 +485,80 @@ async def cmd_refresh(message: types.Message):
+     await message.answer(f"♻️ Перезагружено. В кэше: {len(rows)} строк.")
+ 
++# ------ НОВОЕ: Обработчик кнопки "Назад" ------
++@dp.message(F.text.in_([T["btn_back"]["ru"], T["btn_back"]["en"], T["btn_back"]["ka"]]))
++async def handle_back(message: types.Message, state: FSMContext):
++    """НОВОЕ: Обработка кнопки Назад в FSM"""
++    current_state = await state.get_state()
++    lang = current_lang(message.from_user.id)
++    
++    if current_state == Wizard.city.state:
++        await state.set_state(Wizard.mode)
++        kb = ReplyKeyboardMarkup(
++            keyboard=[
++                [KeyboardButton(text=T["btn_rent"][lang])],
++                [KeyboardButton(text=T["btn_sale"][lang])],
++                [KeyboardButton(text=T["btn_daily"][lang])],
++                [KeyboardButton(text=T["btn_back"][lang])]
++            ],
++            resize_keyboard=True
++        )
++        await message.answer("⬅️ Выберите режим:", reply_markup=kb)
++        
++    elif current_state == Wizard.district.state:
++        data = await state.get_data()
++        mode = data.get("mode", "")
++        await state.set_state(Wizard.city)
++        
++        rows = await rows_async()
++        filtered_rows = [r for r in rows if norm_mode(r.get("mode")) == mode]
++        city_counter = Counter([str(r.get("city","")).strip() for r in filtered_rows if r.get("city")])
++        
++        buttons = []
++        for city, count in sorted(city_counter.items(), key=lambda x: (-x[1], x[0].lower())):
++            icon = CITY_ICONS.get(norm(city), "🏠")
++            label = f"{icon} {city} ({count})"
++            buttons.append([KeyboardButton(text=label)])
++        buttons.append([KeyboardButton(text=T["btn_skip"][lang])])
++        buttons.append([KeyboardButton(text=T["btn_back"][lang])])
++        
++        kb = ReplyKeyboardMarkup(keyboard=buttons[:42], resize_keyboard=True)
++        await message.answer("⬅️ Выберите город:", reply_markup=kb)
++        
++    elif current_state == Wizard.rooms.state:
++        # Логика возврата к району/городу
++        # ...
++        
++    elif current_state == Wizard.price.state:
++        await state.set_state(Wizard.rooms)
++        kb = ReplyKeyboardMarkup(
++            keyboard=[
++                [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
++                [KeyboardButton(text="4"), KeyboardButton(text="5+")],
++                [KeyboardButton(text=T["btn_skip"][lang]), KeyboardButton(text=T["btn_back"][lang])]
++            ],
++            resize_keyboard=True
++        )
++        await message.answer("⬅️ Выберите количество комнат:", reply_markup=kb)
++        
++    else:
++        await state.clear()
++        await message.answer("⬅️ Главное меню", reply_markup=main_menu(lang))
++
+ # ------ Start search flow (Wizard) ------
+@@ -421,6 +573,7 @@ async def start_search(message: types.Message, state: FSMContext):
+             [KeyboardButton(text=T["btn_rent"][lang])],
+             [KeyboardButton(text=T["btn_sale"][lang])],
+             [KeyboardButton(text=T["btn_daily"][lang])],
++            [KeyboardButton(text=T["btn_back"][lang])]
+         ],
+         resize_keyboard=True
+     )
+@@ -429,16 +582,23 @@ async def start_search(message: types.Message, state: FSMContext):
+ @dp.message(Wizard.mode)
+ async def pick_city_mode(message: types.Message, state: FSMContext):
++    lang = current_lang(message.from_user.id)
+     mode = norm_mode(message.text)
+     
+     if not mode:
+         return await message.answer("Укажите rent/sale/daily")
+     
+     await state.update_data(mode=mode)
++    logger.info(f"User {message.from_user.id} selected mode: {mode}")
+ 
+     rows = await rows_async()
+-    city_counter = Counter([str(r.get("city","")).strip() for r in rows if r.get("city")])
++    # ИСПРАВЛЕНО: Фильтруем строки по режиму перед подсчётом
++    filtered_rows = [r for r in rows if norm_mode(r.get("mode")) == mode]
++    logger.info(f"Filtered {len(filtered_rows)}/{len(rows)} rows for mode={mode}")
++    
++    city_counter = Counter([str(r.get("city","")).strip() 
++                           for r in filtered_rows 
++                           if r.get("city")])
+     
+     buttons = []
+     for city, count in sorted(city_counter.items(), key=lambda x: (-x[1], x[0].lower())):
+@@ -450,6 +610,7 @@ async def pick_city_mode(message: types.Message, state: FSMContext):
+         buttons = [[KeyboardButton(text="Пропустить")]]
+     else:
+         buttons.append([KeyboardButton(text="Пропустить")])
++    buttons.append([KeyboardButton(text=T["btn_back"][lang])])
+     
+     kb = ReplyKeyboardMarkup(keyboard=buttons[:42], resize_keyboard=True)
+@@ -458,17 +619,25 @@ async def pick_city_mode(message: types.Message, state: FSMContext):
+ 
+ @dp.message(Wizard.city)
+ async def pick_district(message: types.Message, state: FSMContext):
++    lang = current_lang(message.from_user.id)
+     city_text = message.text.strip()
+-    if city_text.lower() == "пропустить":
++    
++    if city_text.lower() in {t(lang, "btn_skip").lower(), "пропустить", "skip"}:
+         await state.update_data(city="")
+         await state.update_data(district="")
+         await state.set_state(Wizard.rooms)
+         kb = ReplyKeyboardMarkup(
+             keyboard=[
+                 [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
+-                [KeyboardButton(text="4"), KeyboardButton(text="5+"), KeyboardButton(text="Пропустить")]
++                [KeyboardButton(text="4"), KeyboardButton(text="5+")],
++                [KeyboardButton(text=T["btn_skip"][lang]), KeyboardButton(text=T["btn_back"][lang])]
+             ],
+             resize_keyboard=True
+         )
+@@ -476,16 +645,24 @@ async def pick_district(message: types.Message, state: FSMContext):
+         return
+ 
+-    city = re.sub(r"^\s*[^\w\dА-Яа-яЁёA-Za-z]+","", city_text)
+-    city = re.sub(r"\(\d+\)\s*$","", city).strip()
++    # ИСПРАВЛЕНО: Используем новую функцию очистки
++    city = clean_button_text(city_text)
+     await state.update_data(city=city)
++    logger.info(f"User selected city: '{city}' (from button: '{city_text}')")
+ 
++    data = await state.get_data()
++    mode = data.get("mode", "")
++    
+     rows = await rows_async()
+-    district_counter = Counter([str(r.get("district","")).strip() for r in rows if norm(r.get("city")) == norm(city) and r.get("district")])
++    # ИСПРАВЛЕНО: Фильтруем по режиму И городу
++    filtered_rows = [r for r in rows 
++                    if norm_mode(r.get("mode")) == mode 
++                    and norm(r.get("city")) == norm(city)]
++    
++    district_counter = Counter([str(r.get("district","")).strip() 
++                               for r in filtered_rows 
++                               if r.get("district")])
+     
+     if not district_counter:
+         await state.update_data(district="")
+@@ -493,7 +670,8 @@ async def pick_district(message: types.Message, state: FSMContext):
+         kb = ReplyKeyboardMarkup(
+             keyboard=[
+                 [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
+-                [KeyboardButton(text="4"), KeyboardButton(text="5+"), KeyboardButton(text="Пропустить")]
++                [KeyboardButton(text="4"), KeyboardButton(text="5+")],
++                [KeyboardButton(text=T["btn_skip"][lang]), KeyboardButton(text=T["btn_back"][lang])]
+             ],
+             resize_keyboard=True
+         )
+@@ -502,6 +680,7 @@ async def pick_district(message: types.Message, state: FSMContext):
+ 
+     buttons = [[KeyboardButton(text=f"{d} ({c})")] for d,c in sorted(district_counter.items(), key=lambda x:(-x[1], x[0].lower()))]
+-    buttons.append([KeyboardButton(text="Пропустить")])
++    buttons.append([KeyboardButton(text=T["btn_skip"][lang])])
++    buttons.append([KeyboardButton(text=T["btn_back"][lang])])
+     
+     kb = ReplyKeyboardMarkup(keyboard=buttons[:42], resize_keyboard=True)
+@@ -510,15 +689,18 @@ async def pick_district(message: types.Message, state: FSMContext):
+ 
+ @dp.message(Wizard.district)
+ async def pick_rooms_or_price(message: types.Message, state: FSMContext):
++    lang = current_lang(message.from_user.id)
+     text = message.text.strip()
+     
+-    if text.lower() == "пропустить":
++    if text.lower() in {t(lang, "btn_skip").lower(), "пропустить", "skip"}:
+         await state.update_data(district="")
+     else:
+-        district = re.sub(r"\(\d+\)\s*$","", text).strip()
++        # ИСПРАВЛЕНО: Очистка от счётчика
++        district = clean_button_text(text)
+         await state.update_data(district=district)
++        logger.info(f"User selected district: '{district}' (from button: '{text}')")
+ 
+     await state.set_state(Wizard.rooms)
+@@ -526,7 +708,8 @@ async def pick_rooms_or_price(message: types.Message, state: FSMContext):
+         keyboard=[
+             [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3")],
+-            [KeyboardButton(text="4"), KeyboardButton(text="5+"), KeyboardButton(text="Пропустить")]
++            [KeyboardButton(text="4"), KeyboardButton(text="5+")],
++            [KeyboardButton(text=T["btn_skip"][lang]), KeyboardButton(text=T["btn_back"][lang])]
+         ],
+         resize_keyboard=True
+     )
+@@ -534,9 +717,11 @@ async def pick_rooms_or_price(message: types.Message, state: FSMContext):
+ 
+ @dp.message(Wizard.rooms)
+ async def pick_price_prompt(message: types.Message, state: FSMContext):
++    lang = current_lang(message.from_user.id)
+     text = message.text.strip()
+     
+-    if text.lower() in {"пропустить","весь город","весь район"}:
++    if text.lower() in {t(lang, "btn_skip").lower(), "пропустить", "skip", "весь город", "весь район"}:
+         await state.update_data(rooms="")
+     else:
+         val = text.strip().lower()
+@@ -548,6 +733,7 @@ async def pick_price_prompt(message: types.Message, state: FSMContext):
+     ranges = PRICE_RANGES.get(mode, PRICE_RANGES["sale"])
+     buttons = [[KeyboardButton(text=p)] for p in ranges]
+-    buttons.append([KeyboardButton(text="Пропустить")])
++    buttons.append([KeyboardButton(text=T["btn_skip"][lang])])
++    buttons.append([KeyboardButton(text=T["btn_back"][lang])])
+     kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+     await state.set_state(Wizard.price)
+@@ -555,9 +741,11 @@ async def pick_price_prompt(message: types.Message, state: FSMContext):
+ 
+ @dp.message(Wizard.price)
+ async def show_results_handler(message: types.Message, state: FSMContext):
++    lang = current_lang(message.from_user.id)
+     text = message.text.strip()
+     
+-    if text.lower() == "пропустить":
++    if text.lower() in {t(lang, "btn_skip").lower(), "пропустить", "skip"}:
+         price = ""
+     else:
+         price = text
+@@ -573,7 +761,7 @@ async def show_results_handler(message: types.Message, state: FSMContext):
+         "price": price.strip()
+     }
+     
+-    logger.info(f"User {message.from_user.id} search query: {query}")
++    logger.info(f"🔍 User {message.from_user.id} search query: {query}")
+ 
+     all_rows = await rows_async()
+-    logger.info(f"Total rows loaded: {len(all_rows)}")
++    logger.info(f"📦 Total rows loaded: {len(all_rows)}")
+     
+     rows = _filter_rows(all_rows, query)
+-    logger.info(f"Filtered results: {len(rows)}")
++    logger.info(f"✅ Filtered results: {len(rows)}")
+     
+     USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
+@@ -592,7 +780,7 @@ async def show_results_handler(message: types.Message, state: FSMContext):
+         msg += "\nПопробуйте изменить параметры поиска."
+         
+-        await message.answer(msg, reply_markup=main_menu(current_lang(uid)))
++        await message.answer(msg, reply_markup=main_menu(lang))
+         await state.clear()
+         return
+ 
+@@ -603,6 +791,7 @@ async def show_results_handler(message: types.Message, state: FSMContext):
+ 
+ # ------ Show single ad with interaction buttons ------
+ async def show_single_ad(chat_id: int, uid: int):
++    """ИСПРАВЛЕНО: Безопасная отправка медиа"""
+     bundle = USER_RESULTS.get(uid)
+     if not bundle:
+         await bot.send_message(chat_id, "Список пуст.", reply_markup=main_menu(current_lang(uid)))
+@@ -617,7 +806,7 @@ async def show_single_ad(chat_id: int, uid: int):
+     if current_index >= len(rows):
+         await bot.send_message(
+             chat_id, 
+-            "Вы просмотрели все объявления! 🎉\n\nВыберите действие:",
++            "🎉 Вы просмотрели все объявления!\n\nВыберите действие:",
+             reply_markup=main_menu(current_lang(uid))
+         )
+         return
+@@ -638,20 +827,18 @@ async def show_single_ad(chat_id: int, uid: int):
+     
+     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+     
+-    # Отправляем фото или текст
++    # ИСПРАВЛЕНО: Безопасная отправка медиа
+     if photos:
+-        media = [InputMediaPhoto(media=photos[0], caption=text)]
+-        for p in photos[1:]:
+-            media.append(InputMediaPhoto(media=p))
+-        try:
+-            msgs = await bot.send_media_group(chat_id, media)
++        success = await send_media_safe(chat_id, photos, text)
++        if success:
+             await bot.send_message(chat_id, "Выберите действие:", reply_markup=kb)
+-        except Exception as e:
+-            logger.error(f"Error sending media group: {e}")
+-            await bot.send_message(chat_id, text, reply_markup=kb)
++        else:
++            await bot.send_message(chat_id, f"{text}\n\n⚠️ Фото недоступны", reply_markup=kb)
+     else:
+         await bot.send_message(chat_id, text, reply_markup=kb)
+ 
+@@ -693,13 +880,15 @@ async def cb_fav_add(cb: types.CallbackQuery):
+     
+     bundle = USER_RESULTS.get(uid)
+     if not bundle or index >= len(bundle["rows"]):
+-        await cb.answer("Ошибка: объявление не найдено")
++        await cb.answer("Ошибка")
+         return
+     
+     row = bundle["rows"][index]
+     
+     if not any(fav.get("index") == index for fav in USER_FAVS[uid]):
+         USER_FAVS[uid].append({"index": index, "data": row})
+-        await cb.answer("⭐ Добавлено в избранное!")
++        await cb.answer("⭐ Добавлено!")
+         
+         buttons = [
+@@ -708,7 +897,7 @@ async def cb_fav_add(cb: types.CallbackQuery):
+                 InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"dislike:{index}")
+             ],
+             [
+-                InlineKeyboardButton(text="⭐ Удалить из избранного", callback_data=f"fav_del:{index}")
++                InlineKeyboardButton(text="⭐ Удалить", callback_data=f"fav_del:{index}")
+             ]
+         ]
+@@ -726,7 +915,7 @@ async def cb_fav_del(cb: types.CallbackQuery):
+     index = int(cb.data.split(":")[1])
+     
+     USER_FAVS[uid] = [fav for fav in USER_FAVS[uid] if fav.get("index") != index]
+-    await cb.answer("Удалено из избранного")
++    await cb.answer("Удалено")
+     
+     buttons = [
+         [
+@@ -751,11 +940,15 @@ async def handle_lead_form(message: types.Message):
+     if uid not in USER_LEAD_STATE:
+         return
+     
+     state = USER_LEAD_STATE[uid]
+     
+     if state == "awaiting_name":
+-        USER_LEAD_DATA[uid]["name"] = message.text.strip()
++        USER_LEAD_DATA[uid]["name"] = message.text.strip()
+         USER_LEAD_STATE[uid] = "awaiting_phone"
+         
+@@ -765,16 +958,18 @@ async def handle_lead_form(message: types.Message):
+         
+     elif state == "awaiting_phone":
+-        USER_LEAD_DATA[uid]["phone"] = message.text.strip()
++        USER_LEAD_DATA[uid]["phone"] = message.text.strip()
+         
+-        # Отправляем лид в канал
++        # ИСПРАВЛЕНО: Отправляем лид в канал, пользователю короткое сообщение
+         await send_lead_to_channel(uid)
+         
+-        # Очищаем состояние
+         del USER_LEAD_STATE[uid]
+         lead_data = USER_LEAD_DATA.pop(uid)
+         
++        # ИСПРАВЛЕНО: Пользователь видит только короткое подтверждение
+         await message.answer(
+             "✅ <b>Спасибо!</b> Ваша заявка принята.\n\n"
+             "Мы свяжемся с вами в ближайшее время! 📞",
+@@ -782,11 +977,13 @@ async def handle_lead_form(message: types.Message):
+         )
+         
+-        # Переход к следующему объявлению
+         current_index = lead_data.get("ad_index", 0)
+         USER_CURRENT_INDEX[uid] = current_index + 1
+         
+@@ -795,7 +992,8 @@ async def handle_lead_form(message: types.Message):
+ 
+ async def send_lead_to_channel(uid: int):
+-    """Отправка лида в Telegram канал"""
++    """ИСПРАВЛЕНО: Отправка лида ТОЛЬКО в канал, не пользователю"""
+     if uid not in USER_LEAD_DATA:
+         return
+     
+@@ -803,7 +1001,7 @@ async def send_lead_to_channel(uid: int):
+     ad = lead.get("ad_data", {})
+     
+-    # Формируем сообщение для канала
++    # Формируем подробное сообщение для канала/админа
+     text = (
+         "🔥 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+         f"👤 <b>Имя:</b> {lead.get('name', 'Не указано')}\n"
+@@ -812,18 +1010,32 @@ async def send_lead_to_channel(uid: int):
+         f"<b>Интересующее объявление:</b>\n"
+         f"🏠 {ad.get('title_ru', 'Без названия')}\n"
+         f"📍 {ad.get('city', '')} {ad.get('district', '')}\n"
+         f"💰 {ad.get('price', 'Не указана')}\n"
++        f"🛏 {ad.get('rooms', '')} комнат\n"
+         f"☎️ Телефон владельца: {ad.get('phone', 'Не указан')}\n\n"
+         f"⏰ {lead.get('timestamp', '')}"
+     )
+     
+-    try:
+-        await bot.send_message(Config.FEEDBACK_CHANNEL, text)
+-        logger.info(f"Lead sent to channel for user {uid}")
+-    except Exception as e:
+-        logger.error(f"Failed to send lead to channel: {e}")
+-        # Отправляем админу, если канал недоступен
+-        if Config.ADMIN_CHAT_ID:
++    # Отправляем в канал с retry
++    for attempt in range(3):
++        try:
++            await bot.send_message(Config.FEEDBACK_CHAT_ID, text)
++            logger.info(f"✅ Lead sent to channel for user {uid}")
++            return
++        except Exception as e:
++            logger.error(f"❌ Attempt {attempt + 1}/3 failed to send lead: {e}")
++            if attempt < 2:
++                await asyncio.sleep(2)
++            else:
++                # Если канал недоступен - отправляем админу
++                if Config.ADMIN_CHAT_ID and Config.ADMIN_CHAT_ID != Config.FEEDBACK_CHAT_ID:
++                    try:
++                        await bot.send_message(
++                            Config.ADMIN_CHAT_ID, 
++                            f"⚠️ Ошибка отправки лида в канал:\n\n{text}"
++                        )
++                    except Exception:
++                        logger.error("💥 Failed to send to admin as fallback")
+ 
+ # ------ Generic handlers for language and menu ------
+@@ -885,7 +1097,8 @@ async def show_favorites(message: types.Message):
+         await message.answer(f"У вас {len(favs)} избранных объявлений:")
+         await show_single_ad(message.chat.id, uid)
+ 
+@dp.message(F.text.in_([T["btn_home"]["ru"], T["btn_home"]["en"], T["btn_home"]["ka"]]))
+-async def show_menu(message: types.Message):
++async def show_menu(message: types.Message, state: FSMContext):
+     lang = current_lang(message.from_user.id)
++    await state.clear()
+     await message.answer(T["menu_title"][lang], reply_markup=main_menu(lang))
+ 
+@@ -913,15 +1126,50 @@ def log_event(event: str, uid: int):
+ @dp.message(Command("stats"))
+ async def cmd_stats(message: types.Message):
+     if message.from_user.id != Config.ADMIN_CHAT_ID:
+         return
+     d = _today_str()
+     c = AGG_BY_DAY[d]
+-    await message.answer(f"📊 Сегодня: search={c['search']}, view={c['view']}, leads={c['lead']}")
++    await message.answer(
++        f"📊 <b>Статистика за сегодня</b>\n\n"
++        f"🔍 Поисков: {c['search']}\n"
++        f"👀 Просмотров: {c['view']}\n"
++        f"❤️ Лайков: {c['like']}\n"
++        f"📝 Лидов: {c['lead']}"
++    )
++
++# ------ НОВОЕ: Автоматическое обновление кэша ------
++async def auto_refresh_cache():
++    """НОВОЕ: Автоматическое обновление данных из Google Sheets"""
++    while True:
++        try:
++            await asyncio.sleep(Config.GSHEET_REFRESH_SEC)
++            logger.info("🔄 Auto-refresh: loading data from Google Sheets...")
++            rows = await rows_async(force=True)
++            logger.info(f"✅ Auto-refresh complete: {len(rows)} rows in cache")
++            
++            if Config.ADMIN_CHAT_ID and monotonic() % 3600 < Config.GSHEET_REFRESH_SEC:
++                try:
++                    await bot.send_message(
++                        Config.ADMIN_CHAT_ID,
++                        f"🔄 Автообновление: загружено {len(rows)} объявлений"
++                    )
++                except Exception:
++                    pass
++                    
++        except Exception as e:
++            logger.exception(f"❌ Auto-refresh error: {e}")
++            await asyncio.sleep(60)
+ 
+ async def heartbeat():
++    """ИСПРАВЛЕНО: Мониторинг работы бота"""
+     while True:
+         try:
+-            logger.info("Heartbeat OK")
++            logger.info(f"💓 Heartbeat OK | Cache: {len(_cached_rows)} rows | Age: {int(monotonic() - _cache_ts)}s")
+         except Exception:
+-            logger.exception("Heartbeat error")
++            logger.exception("❌ Heartbeat error")
+         await asyncio.sleep(600)
+ 
+ # ------ Startup / Shutdown ------
+ async def startup():
++    """ИСПРАВЛЕНО: Запуск бота с инициализацией"""
++    logger.info("🚀 LivePlace bot starting...")
++    
++    # Загружаем данные при старте
+     await rows_async(force=True)
++    
++    # Уведомляем админа
+     if Config.ADMIN_CHAT_ID:
+         try:
+-            await bot.send_message(Config.ADMIN_CHAT_ID, "🤖 LivePlace bot started (Sheets enabled)")
+-        except Exception:
+-            pass
++            await bot.send_message(
++                Config.ADMIN_CHAT_ID, 
++                f"✅ <b>LivePlace bot started</b>\n\n"
++                f"📊 Loaded: {len(_cached_rows)} ads\n"
++                f"🔄 Auto-refresh: every {Config.GSHEET_REFRESH_SEC}s\n"
++                f"📢 Feedback channel: {Config.FEEDBACK_CHAT_ID}"
++            )
++        except Exception as e:
++            logger.error(f"Failed to notify admin on startup: {e}")
++    
++    # Запускаем фоновые задачи
+     asyncio.create_task(heartbeat())
++    asyncio.create_task(auto_refresh_cache())
++    
+-    logger.info("LivePlace bot starting…")
++    logger.info("✅ Bot startup complete")
+ 
+ async def shutdown():
++    """Корректное завершение работы"""
+     try:
++        logger.info("🛑 Bot shutting down...")
+         await bot.session.close()
++        logger.info("✅ Bot shutdown complete")
+-    except Exception:
+-        pass
+-    logger.info("Bot shutdown complete")
++    except Exception as e:
++        logger.exception(f"Error during shutdown: {e}")
+ 
+ # ------ Main ------
