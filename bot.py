@@ -332,41 +332,82 @@ async def maybe_show_ad_by_chat(chat_id: int, uid: int):
 # ------ Filtering ------
 def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str, Any]]:
     def ok(r):
-        if q.get("mode") and norm_mode(r.get("mode")) != q["mode"]: 
-            return False
-        if q.get("city") and norm(r.get("city")) != norm(q["city"]): 
-            return False
-        if q.get("district") and norm(r.get("district")) != norm(q["district"]): 
-            return False
-        if q.get("rooms"):
-            try:
-                need = float(q["rooms"])
-                have = parse_rooms(r.get("rooms"))
-                if have < 0: return False
-                if int(need) != int(have) and not (need==0.5 and have==0.5):
-                    return False
-            except Exception:
+        # Проверяем режим (обязательный параметр)
+        if q.get("mode"):
+            row_mode = norm_mode(r.get("mode"))
+            if row_mode != q["mode"]:
                 return False
-        if q.get("price"):
+        
+        # Проверяем город (только если указан и не пуст)
+        if q.get("city") and q["city"].strip():
+            if norm(r.get("city")) != norm(q["city"]):
+                return False
+        
+        # Проверяем район (только если указан и не пуст)
+        if q.get("district") and q["district"].strip():
+            if norm(r.get("district")) != norm(q["district"]):
+                return False
+        
+        # Проверяем количество комнат (только если указано и не пусто)
+        if q.get("rooms") and q["rooms"].strip():
+            try:
+                need = float(q["rooms"].replace("+", ""))
+                have = parse_rooms(r.get("rooms"))
+                if have < 0:
+                    return False
+                # Для 5+ комнат - показываем все >= 5
+                if "+" in str(q["rooms"]):
+                    if have < need:
+                        return False
+                else:
+                    # Точное совпадение (с учетом студии)
+                    if int(need) != int(have) and not (need == 0.5 and have == 0.5):
+                        return False
+            except Exception:
+                # Если не удалось распарсить - пропускаем фильтр
+                pass
+        
+        # Проверяем цену (только если указана и не пуста)
+        if q.get("price") and q["price"].strip() and q["price"].lower() != "пропустить":
             try:
                 pr = str(q["price"])
                 if "-" in pr:
-                    left, right = pr.split("-",1)
+                    parts = pr.split("-", 1)
+                    left = parts[0]
+                    right = parts[1] if len(parts) > 1 else ""
+                    
                     left_val = float(re.sub(r"[^\d]", "", left) or "0")
-                    right_val = float(re.sub(r"[^\d]", "", right) or "0")
-                    p = float(re.sub(r"[^\d.]", "", str(r.get("price","")) or "0") or 0)
-                    if right_val==0:
-                        if p < left_val: return False
+                    right_val = float(re.sub(r"[^\d]", "", right) or "0") if right else 0
+                    
+                    p = float(re.sub(r"[^\d.]", "", str(r.get("price", "")) or "0") or 0)
+                    
+                    if p == 0:  # Пропускаем объявления без цены
+                        return True
+                    
+                    if right_val == 0:
+                        # Диапазон "от X и выше"
+                        if p < left_val:
+                            return False
                     else:
-                        if p < left_val or p > right_val: return False
+                        # Диапазон "от X до Y"
+                        if p < left_val or p > right_val:
+                            return False
                 else:
+                    # Точная цена или максимум
                     cap = float(re.sub(r"[^\d.]", "", pr) or "0")
-                    p = float(re.sub(r"[^\d.]", "", str(r.get("price","")) or "0") or 0)
-                    if p > cap: return False
-            except Exception:
-                return False
+                    p = float(re.sub(r"[^\d.]", "", str(r.get("price", "")) or "0") or 0)
+                    if p > cap and cap > 0:
+                        return False
+            except Exception as e:
+                logger.error(f"Price filter error: {e}")
+                # Если ошибка парсинга цены - не отбрасываем объявление
+                pass
+        
         return True
-    return [r for r in rows if ok(r)]
+    
+    filtered = [r for r in rows if ok(r)]
+    logger.info(f"Filtered {len(filtered)} rows from {len(rows)} total with query: {q}")
+    return filtered
 
 def _slice(listing: List[Any], page: int, size: int) -> List[Any]:
     return listing[page*size:(page+1)*size]
@@ -452,6 +493,8 @@ async def pick_district(message: types.Message, state: FSMContext):
     city_text = message.text.strip()
     if city_text.lower() == "пропустить":
         await state.update_data(city="")
+        # Пропускаем район и идем к комнатам
+        await state.update_data(district="")
         await state.set_state(Wizard.rooms)
         kb = ReplyKeyboardMarkup(
             keyboard=[
@@ -537,23 +580,46 @@ async def show_results_handler(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     await state.update_data(price=price)
+    
+    # Очищаем пустые значения из query
     query = {
-        "mode": data.get("mode"),
-        "city": data.get("city",""),
-        "district": data.get("district",""),
-        "rooms": data.get("rooms",""),
-        "price": price
+        "mode": data.get("mode", ""),
+        "city": data.get("city", "").strip(),
+        "district": data.get("district", "").strip(),
+        "rooms": data.get("rooms", "").strip(),
+        "price": price.strip()
     }
+    
+    logger.info(f"User {message.from_user.id} search query: {query}")
 
-    rows = _filter_rows(await rows_async(), query)
+    all_rows = await rows_async()
+    logger.info(f"Total rows loaded: {len(all_rows)}")
+    
+    rows = _filter_rows(all_rows, query)
+    logger.info(f"Filtered results: {len(rows)}")
+    
     USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
     USER_CURRENT_INDEX[message.from_user.id] = 0
     
     if not rows:
-        await message.answer("Ничего не найдено по вашим параметрам.", reply_markup=main_menu(current_lang(message.from_user.id)))
+        # Показываем более информативное сообщение
+        msg = "❌ Ничего не найдено по вашим параметрам.\n\n"
+        msg += f"Режим: {query['mode']}\n"
+        if query['city']:
+            msg += f"Город: {query['city']}\n"
+        if query['district']:
+            msg += f"Район: {query['district']}\n"
+        if query['rooms']:
+            msg += f"Комнат: {query['rooms']}\n"
+        if query['price']:
+            msg += f"Цена: {query['price']}\n"
+        msg += "\nПопробуйте изменить параметры поиска."
+        
+        await message.answer(msg, reply_markup=main_menu(current_lang(message.from_user.id)))
         await state.clear()
         return
 
+    await message.answer(f"✅ Найдено объявлений: {len(rows)}")
     await show_single_ad(message.chat.id, message.from_user.id)
     await state.clear()
 
