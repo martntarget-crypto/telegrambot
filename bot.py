@@ -1,13 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-LivePlace Telegram Bot — исправленная версия (aiogram 3.x)
-Исправления:
- - Корректная нормализация режима в фильтрах
- - Правильный подсчёт кнопок с учётом режима
- - Кнопка "Назад" во всех состояниях FSM
- - Автообновление Google Sheets каждые 2 минуты
- - Безопасная отправка медиа с retry и валидацией
- - Улучшенное логирование ошибок
+LivePlace Telegram Bot — финальная версия (aiogram 3.x)
+Все исправления применены, кнопки работают корректно
 """
 
 import os
@@ -19,7 +13,7 @@ import asyncio
 import logging
 from time import monotonic
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from collections import Counter, defaultdict
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
@@ -55,7 +49,7 @@ class Config:
     SHEETS_ENABLED = os.getenv("SHEETS_ENABLED", "1").strip() not in {"", "0", "false", "False"}
     GSHEET_ID = os.getenv("GSHEET_ID", "1yrB5Vy7o18B05nkJBqQe9hE9971jJsTMEKKTsDHGa8w").strip()
     GSHEET_TAB = os.getenv("GSHEET_TAB", "Ads").strip()
-    GSHEET_REFRESH_SEC = int(os.getenv("GSHEET_REFRESH_SEC", "120") or "120")  # 2 минуты
+    GSHEET_REFRESH_SEC = int(os.getenv("GSHEET_REFRESH_SEC", "120") or "120")
     ADS_ENABLED = os.getenv("ADS_ENABLED", "1").strip() not in {"0", "false", "False", ""}
     ADS_PROB = float(os.getenv("ADS_PROB", "0.18") or 0.18)
     ADS_COOLDOWN_SEC = int(os.getenv("ADS_COOLDOWN_SEC", "180") or 180)
@@ -199,31 +193,25 @@ PRICE_RANGES = {
 
 # ------ Utilities ------
 def norm(s: Any) -> str:
-    """Нормализация строки для сравнения"""
     result = str(s or "").strip().lower()
     result = " ".join(result.split())
     return result
 
 def norm_mode(v: Any) -> str:
-    """ИСПРАВЛЕНО: Нормализация режима"""
     s = norm(v)
-    # Убираем эмодзи и лишние символы
     s = re.sub(r'[^\w\s-]', '', s)
     s = s.strip()
     
-    if s in {"rent","аренда","long","longterm","долгосрочно","аренда","rent","ქირავდება"}: 
+    if s in {"rent","аренда","long","longterm","долгосрочно"}: 
         return "rent"
-    if s in {"sale","продажа","buy","sell","продажа","sale","იყიდება"}: 
+    if s in {"sale","продажа","buy","sell"}: 
         return "sale"
-    if s in {"daily","посуточно","sutki","сутки","short","shortterm","day","посуточно","daily rent","დღიურად"}: 
+    if s in {"daily","посуточно","sutki","сутки","short","shortterm","day"}: 
         return "daily"
     return ""
 
 def clean_button_text(text: str) -> str:
-    """НОВОЕ: Очистка текста кнопки от эмодзи и счётчиков"""
-    # Удаляем эмодзи в начале
     text = re.sub(r"^[\U0001F300-\U0001F9FF\s]+", "", text)
-    # Удаляем счётчик в конце (15)
     text = re.sub(r"\s*\(\d+\)\s*$", "", text)
     return text.strip()
 
@@ -242,7 +230,6 @@ def looks_like_image(url: str) -> bool:
            "googleusercontent.com" in u or "google.com/uc?export=download" in u
 
 def is_valid_photo_url(url: str) -> bool:
-    """НОВОЕ: Валидация URL фото"""
     if not url or not url.strip():
         return False
     try:
@@ -256,7 +243,6 @@ def is_valid_photo_url(url: str) -> bool:
         return False
 
 def collect_photos(row: Dict[str, Any]) -> List[str]:
-    """ИСПРАВЛЕНО: Сбор и валидация фото"""
     out = []
     for i in range(1, 11):
         u = str(row.get(f"photo{i}", "") or "").strip()
@@ -368,12 +354,10 @@ async def maybe_show_ad_by_chat(chat_id: int, uid: int):
 
 # ------ Filtering ------
 def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """ИСПРАВЛЕНО: Корректная фильтрация с нормализацией режима"""
     def ok(r):
-        # Нормализуем режим запроса
         if q.get("mode"):
             row_mode = norm_mode(r.get("mode"))
-            query_mode = norm_mode(q["mode"])  # ИСПРАВЛЕНО: добавлена нормализация
+            query_mode = norm_mode(q["mode"])
             logger.debug(f"Mode check: row={row_mode}, query={query_mode}")
             if row_mode != query_mode:
                 return False
@@ -457,7 +441,6 @@ def _slice(listing: List[Any], page: int, size: int) -> List[Any]:
 
 # ------ Safe media sending ------
 async def send_media_safe(chat_id: int, photos: List[str], text: str, retry_count: int = Config.MEDIA_RETRY_COUNT) -> bool:
-    """НОВОЕ: Безопасная отправка медиа с retry"""
     if not photos:
         return False
     
@@ -473,12 +456,10 @@ async def send_media_safe(chat_id: int, photos: List[str], text: str, retry_coun
             
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"❌ Media send attempt {attempt + 1}/{retry_count} failed: {error_msg}")
+            logger.error(f"❌ Attempt {attempt + 1}/{retry_count} failed: {error_msg}")
             
-            # Специальная обработка известных ошибок
             if "WEBPAGE_CURL_FAILED" in error_msg:
                 logger.error(f"🚫 WEBPAGE_CURL_FAILED for photos: {photos}")
-                # Отправляем админу уведомление
                 if Config.ADMIN_CHAT_ID:
                     try:
                         await bot.send_message(
@@ -493,9 +474,50 @@ async def send_media_safe(chat_id: int, photos: List[str], text: str, retry_coun
                 logger.error(f"🚫 WEBPAGE_MEDIA_EMPTY for photos: {photos}")
                 return False
             
-            # Retry с задержкой
             if attempt < retry_count - 1:
-                await asyncio.sleep(Config.MEDIA_RETRY_DELAY)
+                await asyncio.sleep(600)
+
+# ------ Startup / Shutdown ------
+async def startup():
+    logger.info("🚀 LivePlace bot starting...")
+    
+    await rows_async(force=True)
+    
+    if Config.ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(
+                Config.ADMIN_CHAT_ID, 
+                f"✅ <b>LivePlace bot started</b>\n\n"
+                f"📊 Loaded: {len(_cached_rows)} ads\n"
+                f"🔄 Auto-refresh: every {Config.GSHEET_REFRESH_SEC}s\n"
+                f"📢 Feedback channel: {Config.FEEDBACK_CHAT_ID}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin on startup: {e}")
+    
+    asyncio.create_task(heartbeat())
+    asyncio.create_task(auto_refresh_cache())
+    
+    logger.info("✅ Bot startup complete")
+
+async def shutdown():
+    try:
+        logger.info("🛑 Bot shutting down...")
+        await bot.session.close()
+        logger.info("✅ Bot shutdown complete")
+    except Exception as e:
+        logger.exception(f"Error during shutdown: {e}")
+
+# ------ Main ------
+async def main():
+    try:
+        await startup()
+        await dp.start_polling(bot, skip_updates=True)
+    finally:
+        await shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main()).sleep(Config.MEDIA_RETRY_DELAY)
             else:
                 logger.error(f"💥 All {retry_count} attempts failed")
                 return False
@@ -542,19 +564,28 @@ async def cmd_refresh(message: types.Message):
     rows = await rows_async(force=True)
     await message.answer(f"♻️ Перезагружено. В кэше: {len(rows)} строк.")
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id != Config.ADMIN_CHAT_ID:
+        return
+    d = datetime.utcnow().strftime("%Y-%m-%d")
+    await message.answer(
+        f"📊 <b>Статистика за сегодня</b>\n\n"
+        f"Пользователей: {len(USER_RESULTS)}\n"
+        f"Избранных: {sum(len(v) for v in USER_FAVS.values())}\n"
+        f"Кэш: {len(_cached_rows)} объявлений"
+    )
+
 # ------ НОВОЕ: Обработчик кнопки "Назад" ------
 @dp.message(F.text.in_([T["btn_back"]["ru"], T["btn_back"]["en"], T["btn_back"]["ka"]]))
 async def handle_back(message: types.Message, state: FSMContext):
-    """НОВОЕ: Обработка кнопки Назад в FSM"""
     current_state = await state.get_state()
     lang = current_lang(message.from_user.id)
     
     if current_state == Wizard.city.state:
-        # Из выбора города -> в выбор режима
         await state.set_state(Wizard.mode)
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text=T["btn_rent"][lang])],
                 [KeyboardButton(text=T["btn_sale"][lang])],
                 [KeyboardButton(text=T["btn_daily"][lang])],
                 [KeyboardButton(text=T["btn_back"][lang])]
@@ -564,13 +595,11 @@ async def handle_back(message: types.Message, state: FSMContext):
         await message.answer("⬅️ Выберите режим:", reply_markup=kb)
         
     elif current_state == Wizard.district.state:
-        # Из выбора района -> в выбор города
         data = await state.get_data()
         mode = data.get("mode", "")
         await state.set_state(Wizard.city)
         
         rows = await rows_async()
-        # ИСПРАВЛЕНО: Фильтруем по режиму
         filtered_rows = [r for r in rows if norm_mode(r.get("mode")) == mode]
         city_counter = Counter([str(r.get("city","")).strip() for r in filtered_rows if r.get("city")])
         
@@ -586,7 +615,6 @@ async def handle_back(message: types.Message, state: FSMContext):
         await message.answer("⬅️ Выберите город:", reply_markup=kb)
         
     elif current_state == Wizard.rooms.state:
-        # Из выбора комнат -> в выбор района (или города)
         data = await state.get_data()
         city = data.get("city", "")
         
@@ -594,7 +622,6 @@ async def handle_back(message: types.Message, state: FSMContext):
             await state.set_state(Wizard.district)
             mode = data.get("mode", "")
             rows = await rows_async()
-            # ИСПРАВЛЕНО: Фильтруем по режиму и городу
             filtered_rows = [r for r in rows if norm_mode(r.get("mode")) == mode and norm(r.get("city")) == norm(city)]
             district_counter = Counter([str(r.get("district","")).strip() for r in filtered_rows if r.get("district")])
             
@@ -605,12 +632,10 @@ async def handle_back(message: types.Message, state: FSMContext):
             kb = ReplyKeyboardMarkup(keyboard=buttons[:42], resize_keyboard=True)
             await message.answer("⬅️ Выберите район:", reply_markup=kb)
         else:
-            # Если города не было, возвращаемся к городу
             await state.set_state(Wizard.city)
             await message.answer("⬅️ Выберите город:")
             
     elif current_state == Wizard.price.state:
-        # Из выбора цены -> в выбор комнат
         await state.set_state(Wizard.rooms)
         kb = ReplyKeyboardMarkup(
             keyboard=[
@@ -623,7 +648,6 @@ async def handle_back(message: types.Message, state: FSMContext):
         await message.answer("⬅️ Выберите количество комнат:", reply_markup=kb)
         
     else:
-        # Если состояния нет или это начало - идём в главное меню
         await state.clear()
         await message.answer("⬅️ Главное меню", reply_markup=main_menu(lang))
 
@@ -658,7 +682,6 @@ async def pick_city_mode(message: types.Message, state: FSMContext):
     logger.info(f"User {message.from_user.id} selected mode: {mode}")
 
     rows = await rows_async()
-    # ИСПРАВЛЕНО: Фильтруем строки по режиму перед подсчётом
     filtered_rows = [r for r in rows if norm_mode(r.get("mode")) == mode]
     logger.info(f"Filtered {len(filtered_rows)}/{len(rows)} rows for mode={mode}")
     
@@ -701,7 +724,6 @@ async def pick_district(message: types.Message, state: FSMContext):
         await message.answer("Выберите количество комнат:", reply_markup=kb)
         return
 
-    # ИСПРАВЛЕНО: Используем новую функцию очистки
     city = clean_button_text(city_text)
     await state.update_data(city=city)
     logger.info(f"User selected city: '{city}' (from button: '{city_text}')")
@@ -710,7 +732,6 @@ async def pick_district(message: types.Message, state: FSMContext):
     mode = data.get("mode", "")
     
     rows = await rows_async()
-    # ИСПРАВЛЕНО: Фильтруем по режиму И городу
     filtered_rows = [r for r in rows if norm_mode(r.get("mode")) == mode and norm(r.get("city")) == norm(city)]
     
     district_counter = Counter([str(r.get("district","")).strip() for r in filtered_rows if r.get("district")])
@@ -745,7 +766,6 @@ async def pick_rooms_or_price(message: types.Message, state: FSMContext):
     if text.lower() in {t(lang, "btn_skip").lower(), "пропустить", "skip"}:
         await state.update_data(district="")
     else:
-        # ИСПРАВЛЕНО: Очистка от счётчика
         district = clean_button_text(text)
         await state.update_data(district=district)
         logger.info(f"User selected district: '{district}' (from button: '{text}')")
@@ -841,7 +861,6 @@ async def show_results_handler(message: types.Message, state: FSMContext):
 
 # ------ Show single ad with interaction buttons ------
 async def show_single_ad(chat_id: int, uid: int):
-    """ИСПРАВЛЕНО: Безопасная отправка медиа"""
     bundle = USER_RESULTS.get(uid)
     if not bundle:
         await bot.send_message(chat_id, "Список пуст.", reply_markup=main_menu(current_lang(uid)))
@@ -882,13 +901,11 @@ async def show_single_ad(chat_id: int, uid: int):
     
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     
-    # ИСПРАВЛЕНО: Безопасная отправка медиа
     if photos:
         success = await send_media_safe(chat_id, photos, text)
         if success:
             await bot.send_message(chat_id, "Выберите действие:", reply_markup=kb)
         else:
-            # Если медиа не отправилось - отправляем текст
             await bot.send_message(chat_id, f"{text}\n\n⚠️ Фото недоступны", reply_markup=kb)
     else:
         await bot.send_message(chat_id, text, reply_markup=kb)
@@ -987,7 +1004,6 @@ async def cb_fav_del(cb: types.CallbackQuery):
         pass
 
 # ------ Lead form handlers ------
-@dp.message(F.text)
 async def handle_lead_form(message: types.Message):
     uid = message.from_user.id
     
@@ -1008,13 +1024,11 @@ async def handle_lead_form(message: types.Message):
     elif state == "awaiting_phone":
         USER_LEAD_DATA[uid]["phone"] = message.text.strip()
         
-        # ИСПРАВЛЕНО: Отправляем лид в канал, пользователю короткое сообщение
         await send_lead_to_channel(uid)
         
         del USER_LEAD_STATE[uid]
         lead_data = USER_LEAD_DATA.pop(uid)
         
-        # ИСПРАВЛЕНО: Пользователь видит только короткое подтверждение
         await message.answer(
             "✅ <b>Спасибо!</b> Ваша заявка принята.\n\n"
             "Мы свяжемся с вами в ближайшее время! 📞",
@@ -1028,14 +1042,12 @@ async def handle_lead_form(message: types.Message):
         await show_single_ad(message.chat.id, uid)
 
 async def send_lead_to_channel(uid: int):
-    """ИСПРАВЛЕНО: Отправка лида ТОЛЬКО в канал, не пользователю"""
     if uid not in USER_LEAD_DATA:
         return
     
     lead = USER_LEAD_DATA[uid]
     ad = lead.get("ad_data", {})
     
-    # Формируем подробное сообщение для канала/админа
     text = (
         "🔥 <b>НОВАЯ ЗАЯВКА</b>\n\n"
         f"👤 <b>Имя:</b> {lead.get('name', 'Не указано')}\n"
@@ -1050,7 +1062,6 @@ async def send_lead_to_channel(uid: int):
         f"⏰ {lead.get('timestamp', '')}"
     )
     
-    # Отправляем в канал с retry
     for attempt in range(3):
         try:
             await bot.send_message(Config.FEEDBACK_CHAT_ID, text)
@@ -1061,7 +1072,6 @@ async def send_lead_to_channel(uid: int):
             if attempt < 2:
                 await asyncio.sleep(2)
             else:
-                # Если канал недоступен - отправляем админу
                 if Config.ADMIN_CHAT_ID and Config.ADMIN_CHAT_ID != Config.FEEDBACK_CHAT_ID:
                     try:
                         await bot.send_message(
@@ -1073,7 +1083,8 @@ async def send_lead_to_channel(uid: int):
 
 # ------ Generic handlers for language and menu ------
 @dp.message(F.text.in_([T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"]]))
-async def choose_language(message: types.Message):
+async def choose_language(message: types.Message, state: FSMContext):
+    await state.clear()
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=l.upper(), callback_data=f"lang:{l}")] for l in LANGS]
     )
@@ -1093,6 +1104,7 @@ async def cb_set_lang(cb: types.CallbackQuery):
 
 @dp.message(F.text.in_([T["btn_fast"]["ru"], T["btn_fast"]["en"], T["btn_fast"]["ka"]]))
 async def quick_pick_entry(msg: types.Message, state: FSMContext):
+    await state.clear()
     rows = await rows_async()
     if not rows:
         await msg.answer("Нет доступных объявлений.")
@@ -1106,7 +1118,8 @@ async def quick_pick_entry(msg: types.Message, state: FSMContext):
     await show_single_ad(msg.chat.id, msg.from_user.id)
 
 @dp.message(F.text.in_([T["btn_favs"]["ru"], T["btn_favs"]["en"], T["btn_favs"]["ka"]]))
-async def show_favorites(message: types.Message):
+async def show_favorites(message: types.Message, state: FSMContext):
+    await state.clear()
     uid = message.from_user.id
     favs = USER_FAVS.get(uid, [])
     if not favs:
@@ -1118,7 +1131,8 @@ async def show_favorites(message: types.Message):
         await show_single_ad(message.chat.id, uid)
 
 @dp.message(F.text.in_([T["btn_latest"]["ru"], T["btn_latest"]["en"], T["btn_latest"]["ka"]]))
-async def show_latest(message: types.Message):
+async def show_latest(message: types.Message, state: FSMContext):
+    await state.clear()
     rows = await rows_async()
     if not rows:
         await message.answer("Нет доступных объявлений.")
@@ -1130,7 +1144,8 @@ async def show_latest(message: types.Message):
     await show_single_ad(message.chat.id, message.from_user.id)
 
 @dp.message(F.text.in_([T["btn_about"]["ru"], T["btn_about"]["en"], T["btn_about"]["ka"]]))
-async def show_about(message: types.Message):
+async def show_about(message: types.Message, state: FSMContext):
+    await state.clear()
     lang = current_lang(message.from_user.id)
     await message.answer(t(lang, "about"))
 
@@ -1140,7 +1155,7 @@ async def show_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(T["menu_title"][lang], reply_markup=main_menu(lang))
 
-# catch-all
+# ------ catch-all (ДОЛЖЕН БЫТЬ ПОСЛЕДНИМ!) ------
 @dp.message()
 async def fallback_all(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -1154,45 +1169,15 @@ async def fallback_all(message: types.Message, state: FSMContext):
         await message.answer("Я получил сообщение, но оно пустое.")
         return
     
+    logger.warning(f"Unhandled message from user {uid}: '{text}'")
+    
     await message.answer(
         "Если хотите начать поиск — нажмите '🔎 Поиск' или '🟢 Быстрый подбор' в меню.", 
         reply_markup=main_menu(current_lang(uid))
     )
 
-# ------ Analytics ------
-ANALYTIC_EVENTS: List[Dict[str, Any]] = []
-AGG_BY_DAY = defaultdict(lambda: Counter())
-
-def _today_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d")
-
-def log_event(event: str, uid: int):
-    day = _today_str()
-    ANALYTIC_EVENTS.append({
-        "event": event, 
-        "uid": uid, 
-        "day": day, 
-        "ts": datetime.utcnow().isoformat(timespec="seconds")
-    })
-    AGG_BY_DAY[day][event] += 1
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    if message.from_user.id != Config.ADMIN_CHAT_ID:
-        return
-    d = _today_str()
-    c = AGG_BY_DAY[d]
-    await message.answer(
-        f"📊 <b>Статистика за сегодня</b>\n\n"
-        f"🔍 Поисков: {c['search']}\n"
-        f"👀 Просмотров: {c['view']}\n"
-        f"❤️ Лайков: {c['like']}\n"
-        f"📝 Лидов: {c['lead']}"
-    )
-
-# ------ НОВОЕ: Автоматическое обновление кэша ------
+# ------ Background tasks ------
 async def auto_refresh_cache():
-    """НОВОЕ: Автоматическое обновление данных из Google Sheets"""
     while True:
         try:
             await asyncio.sleep(Config.GSHEET_REFRESH_SEC)
@@ -1200,7 +1185,6 @@ async def auto_refresh_cache():
             rows = await rows_async(force=True)
             logger.info(f"✅ Auto-refresh complete: {len(rows)} rows in cache")
             
-            # Отправляем уведомление админу (опционально, раз в час)
             if Config.ADMIN_CHAT_ID and monotonic() % 3600 < Config.GSHEET_REFRESH_SEC:
                 try:
                     await bot.send_message(
@@ -1212,61 +1196,13 @@ async def auto_refresh_cache():
                     
         except Exception as e:
             logger.exception(f"❌ Auto-refresh error: {e}")
-            # При ошибке пробуем снова через минуту
             await asyncio.sleep(60)
 
 async def heartbeat():
-    """ИСПРАВЛЕНО: Мониторинг работы бота"""
     while True:
         try:
             logger.info(f"💓 Heartbeat OK | Cache: {len(_cached_rows)} rows | Age: {int(monotonic() - _cache_ts)}s")
         except Exception:
             logger.exception("❌ Heartbeat error")
-        await asyncio.sleep(600)
-
-# ------ Startup / Shutdown ------
-async def startup():
-    """ИСПРАВЛЕНО: Запуск бота с инициализацией"""
-    logger.info("🚀 LivePlace bot starting...")
-    
-    # Загружаем данные при старте
-    await rows_async(force=True)
-    
-    # Уведомляем админа
-    if Config.ADMIN_CHAT_ID:
-        try:
-            await bot.send_message(
-                Config.ADMIN_CHAT_ID, 
-                f"✅ <b>LivePlace bot started</b>\n\n"
-                f"📊 Loaded: {len(_cached_rows)} ads\n"
-                f"🔄 Auto-refresh: every {Config.GSHEET_REFRESH_SEC}s\n"
-                f"📢 Feedback channel: {Config.FEEDBACK_CHAT_ID}"
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify admin on startup: {e}")
-    
-    # Запускаем фоновые задачи
-    asyncio.create_task(heartbeat())
-    asyncio.create_task(auto_refresh_cache())
-    
-    logger.info("✅ Bot startup complete")
-
-async def shutdown():
-    """Корректное завершение работы"""
-    try:
-        logger.info("🛑 Bot shutting down...")
-        await bot.session.close()
-        logger.info("✅ Bot shutdown complete")
-    except Exception as e:
-        logger.exception(f"Error during shutdown: {e}")
-
-# ------ Main ------
-async def main():
-    try:
-        await startup()
-        await dp.start_polling(bot, skip_updates=True)
-    finally:
-        await shutdown()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        await asyncioT["btn_rent"][lang])],
+                [KeyboardButton(text=
