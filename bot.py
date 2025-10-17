@@ -475,49 +475,7 @@ async def send_media_safe(chat_id: int, photos: List[str], text: str, retry_coun
                 return False
             
             if attempt < retry_count - 1:
-                await asyncio.sleep(600)
-
-# ------ Startup / Shutdown ------
-async def startup():
-    logger.info("🚀 LivePlace bot starting...")
-    
-    await rows_async(force=True)
-    
-    if Config.ADMIN_CHAT_ID:
-        try:
-            await bot.send_message(
-                Config.ADMIN_CHAT_ID, 
-                f"✅ <b>LivePlace bot started</b>\n\n"
-                f"📊 Loaded: {len(_cached_rows)} ads\n"
-                f"🔄 Auto-refresh: every {Config.GSHEET_REFRESH_SEC}s\n"
-                f"📢 Feedback channel: {Config.FEEDBACK_CHAT_ID}"
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify admin on startup: {e}")
-    
-    asyncio.create_task(heartbeat())
-    asyncio.create_task(auto_refresh_cache())
-    
-    logger.info("✅ Bot startup complete")
-
-async def shutdown():
-    try:
-        logger.info("🛑 Bot shutting down...")
-        await bot.session.close()
-        logger.info("✅ Bot shutdown complete")
-    except Exception as e:
-        logger.exception(f"Error during shutdown: {e}")
-
-# ------ Main ------
-async def main():
-    try:
-        await startup()
-        await dp.start_polling(bot, skip_updates=True)
-    finally:
-        await shutdown()
-
-if __name__ == "__main__":
-    asyncio.run(main()).sleep(Config.MEDIA_RETRY_DELAY)
+                await asyncio.sleep(Config.MEDIA_RETRY_DELAY)
             else:
                 logger.error(f"💥 All {retry_count} attempts failed")
                 return False
@@ -586,6 +544,7 @@ async def handle_back(message: types.Message, state: FSMContext):
         await state.set_state(Wizard.mode)
         kb = ReplyKeyboardMarkup(
             keyboard=[
+                [KeyboardButton(text=T["btn_rent"][lang])],
                 [KeyboardButton(text=T["btn_sale"][lang])],
                 [KeyboardButton(text=T["btn_daily"][lang])],
                 [KeyboardButton(text=T["btn_back"][lang])]
@@ -646,7 +605,6 @@ async def handle_back(message: types.Message, state: FSMContext):
             resize_keyboard=True
         )
         await message.answer("⬅️ Выберите количество комнат:", reply_markup=kb)
-        
     else:
         await state.clear()
         await message.answer("⬅️ Главное меню", reply_markup=main_menu(lang))
@@ -1204,5 +1162,46 @@ async def heartbeat():
             logger.info(f"💓 Heartbeat OK | Cache: {len(_cached_rows)} rows | Age: {int(monotonic() - _cache_ts)}s")
         except Exception:
             logger.exception("❌ Heartbeat error")
-        await asyncioT["btn_rent"][lang])],
-                [KeyboardButton(text=
+        await asyncio.sleep(600)
+
+# ------ Startup / Shutdown ------
+async def startup():
+    logger.info("🚀 LivePlace bot starting...")
+    
+    await rows_async(force=True)
+    
+    if Config.ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(
+                Config.ADMIN_CHAT_ID, 
+                f"✅ <b>LivePlace bot started</b>\n\n"
+                f"📊 Loaded: {len(_cached_rows)} ads\n"
+                f"🔄 Auto-refresh: every {Config.GSHEET_REFRESH_SEC}s\n"
+                f"📢 Feedback channel: {Config.FEEDBACK_CHAT_ID}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin on startup: {e}")
+    
+    asyncio.create_task(heartbeat())
+    asyncio.create_task(auto_refresh_cache())
+    
+    logger.info("✅ Bot startup complete")
+
+async def shutdown():
+    try:
+        logger.info("🛑 Bot shutting down...")
+        await bot.session.close()
+        logger.info("✅ Bot shutdown complete")
+    except Exception as e:
+        logger.exception(f"Error during shutdown: {e}")
+
+# ------ Main ------
+async def main():
+    try:
+        await startup()
+        await dp.start_polling(bot, skip_updates=True)
+    finally:
+        await shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
