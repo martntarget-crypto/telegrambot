@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LivePlace Telegram Bot — финальная версия (aiogram 3.x)
-Все исправления применены, кнопки работают корректно
+LivePlace Telegram Bot — версия с пользовательским ценовым диапазоном
 """
 
 import os
@@ -139,6 +138,8 @@ T = {
     "btn_dislike": {"ru": "👎 Дизлайк", "en": "👎 Dislike", "ka": "👎 არ მომწონს"},
     "btn_fav_add": {"ru": "⭐ В избранное", "en": "⭐ Favorite", "ka": "⭐ რჩეულებში"},
     "btn_fav_del": {"ru": "⭐ Удалить", "en": "⭐ Remove", "ka": "⭐ წაშლა"},
+    "btn_standard_ranges": {"ru": "📊 Стандартные диапазоны", "en": "📊 Standard ranges", "ka": "📊 სტანდარტული დიაპაზონები"},
+    "btn_custom_price": {"ru": "✏️ Свой диапазон", "en": "✏️ Custom range", "ka": "✏️ ჩემი დიაპაზონი"},
     "start": {
         "ru": "<b>LivePlace</b>\n👋 Привет! Я помогу подобрать <b>идеальную недвижимость в Грузии</b>.\n\n<b>Как это работает?</b>\n— 3–4 простых вопроса\n— Покажу лучшие варианты с фото и телефоном владельца\n— Просто посмотреть? Жми <b>🟢 Быстрый подбор</b>\n\nДобро пожаловать! 🏡",
         "en": "<b>LivePlace</b>\n👋 Hi! I'll help you find <b>your ideal home in Georgia</b>.\n\n<b>How it works:</b>\n— 3–4 quick questions\n— Top options with photos & owner phone\n— Just browsing? Tap <b>🟢 Quick picks</b>\n\nWelcome! 🏡",
@@ -312,7 +313,10 @@ class Wizard(StatesGroup):
     city = State()
     district = State()
     rooms = State()
-    price = State()
+    price_method = State()  # НОВОЕ: выбор способа указания цены
+    price_min = State()      # НОВОЕ: минимальная цена
+    price_max = State()      # НОВОЕ: максимальная цена
+    price = State()          # старое состояние для стандартного выбора
 
 # ------ User data ------
 PAGE_SIZE = 8
@@ -392,7 +396,25 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
                 logger.debug(f"Rooms parse error: {e}")
                 pass
         
-        if q.get("price") and q["price"].strip() and q["price"].lower() not in {"пропустить", "skip", "გამოტოვება"}:
+        # НОВАЯ ЛОГИКА: поддержка пользовательского диапазона
+        if q.get("price_min") is not None or q.get("price_max") is not None:
+            try:
+                p = float(re.sub(r"[^\d.]", "", str(r.get("price", "")) or "0") or 0)
+                if p == 0:
+                    return True
+                
+                min_val = q.get("price_min")
+                max_val = q.get("price_max")
+                
+                if min_val is not None and p < min_val:
+                    return False
+                if max_val is not None and p > max_val:
+                    return False
+            except Exception as e:
+                logger.error(f"Custom price filter error: {e}")
+                pass
+        
+        elif q.get("price") and q["price"].strip() and q["price"].lower() not in {"пропустить", "skip", "გამოტოვება"}:
             try:
                 pr = str(q["price"])
                 if "-" in pr:
@@ -593,8 +615,8 @@ async def handle_back(message: types.Message, state: FSMContext):
         else:
             await state.set_state(Wizard.city)
             await message.answer("⬅️ Выберите город:")
-            
-    elif current_state == Wizard.price.state:
+    
+    elif current_state == Wizard.price_method.state:
         await state.set_state(Wizard.rooms)
         kb = ReplyKeyboardMarkup(
             keyboard=[
@@ -605,6 +627,35 @@ async def handle_back(message: types.Message, state: FSMContext):
             resize_keyboard=True
         )
         await message.answer("⬅️ Выберите количество комнат:", reply_markup=kb)
+    
+    elif current_state == Wizard.price.state:
+        await state.set_state(Wizard.price_method)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=T["btn_standard_ranges"][lang])],
+                [KeyboardButton(text=T["btn_custom_price"][lang])],
+                [KeyboardButton(text=T["btn_back"][lang])]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer("⬅️ Как хотите указать цену?", reply_markup=kb)
+    
+    elif current_state == Wizard.price_min.state:
+        await state.set_state(Wizard.price_method)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=T["btn_standard_ranges"][lang])],
+                [KeyboardButton(text=T["btn_custom_price"][lang])],
+                [KeyboardButton(text=T["btn_back"][lang])]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer("⬅️ Как хотите указать цену?", reply_markup=kb)
+    
+    elif current_state == Wizard.price_max.state:
+        await state.set_state(Wizard.price_min)
+        await message.answer("⬅️ Введите минимальную цену в рублях или долларах (например: 500 или 500$):")
+    
     else:
         await state.clear()
         await message.answer("⬅️ Главное меню", reply_markup=main_menu(lang))
@@ -740,7 +791,7 @@ async def pick_rooms_or_price(message: types.Message, state: FSMContext):
     await message.answer("Выберите количество комнат:", reply_markup=kb)
 
 @dp.message(Wizard.rooms)
-async def pick_price_prompt(message: types.Message, state: FSMContext):
+async def pick_price_method(message: types.Message, state: FSMContext):
     lang = current_lang(message.from_user.id)
     text = message.text.strip()
     
@@ -752,18 +803,148 @@ async def pick_price_prompt(message: types.Message, state: FSMContext):
             val = "0.5"
         await state.update_data(rooms=val)
 
-    data = await state.get_data()
-    mode = data.get("mode","sale")
-    ranges = PRICE_RANGES.get(mode, PRICE_RANGES["sale"])
-    
-    buttons = [[KeyboardButton(text=p)] for p in ranges]
-    buttons.append([KeyboardButton(text=T["btn_skip"][lang])])
-    buttons.append([KeyboardButton(text=T["btn_back"][lang])])
-    
-    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-    await state.set_state(Wizard.price)
-    await message.answer("Выберите ценовой диапазон:", reply_markup=kb)
+    # НОВОЕ: выбор метода указания цены
+    await state.set_state(Wizard.price_method)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=T["btn_standard_ranges"][lang])],
+            [KeyboardButton(text=T["btn_custom_price"][lang])],
+            [KeyboardButton(text=T["btn_back"][lang])]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Как вы хотите указать цену?", reply_markup=kb)
 
+# НОВОЕ: обработка выбора метода указания цены
+@dp.message(Wizard.price_method)
+async def handle_price_method(message: types.Message, state: FSMContext):
+    lang = current_lang(message.from_user.id)
+    text = message.text.strip()
+    
+    if text == T["btn_standard_ranges"][lang]:
+        # Стандартные диапазоны
+        data = await state.get_data()
+        mode = data.get("mode","sale")
+        ranges = PRICE_RANGES.get(mode, PRICE_RANGES["sale"])
+        
+        buttons = [[KeyboardButton(text=p)] for p in ranges]
+        buttons.append([KeyboardButton(text=T["btn_skip"][lang])])
+        buttons.append([KeyboardButton(text=T["btn_back"][lang])])
+        
+        kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+        await state.set_state(Wizard.price)
+        await message.answer("Выберите ценовой диапазон:", reply_markup=kb)
+    
+    elif text == T["btn_custom_price"][lang]:
+        # Свой диапазон
+        await state.set_state(Wizard.price_min)
+        await message.answer(
+            "💰 <b>Укажите свой ценовой диапазон</b>\n\n"
+            "Введите <b>минимальную</b> цену в рублях или долларах\n"
+            "(например: 500 или 500$):"
+        )
+
+# НОВОЕ: обработка минимальной цены
+@dp.message(Wizard.price_min)
+async def handle_price_min(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    
+    try:
+        # Извлекаем число из текста
+        price_str = re.sub(r"[^\d.]", "", text)
+        min_price = float(price_str)
+        
+        if min_price < 0:
+            await message.answer("❌ Цена не может быть отрицательной. Попробуйте снова:")
+            return
+        
+        await state.update_data(price_min=min_price)
+        await state.set_state(Wizard.price_max)
+        
+        await message.answer(
+            f"✅ Минимальная цена: {min_price}\n\n"
+            f"Теперь введите <b>максимальную</b> цену\n"
+            f"(или напишите 'без ограничений'):"
+        )
+    
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите корректное число (например: 1000):")
+
+# НОВОЕ: обработка максимальной цены
+@dp.message(Wizard.price_max)
+async def handle_price_max(message: types.Message, state: FSMContext):
+    lang = current_lang(message.from_user.id)
+    text = message.text.strip().lower()
+    
+    data = await state.get_data()
+    min_price = data.get("price_min", 0)
+    
+    if text in ['без ограничений', 'без ограничения', 'неограниченно', 'no limit', 'unlimited']:
+        max_price = None
+        price_range = f"от {min_price}"
+    else:
+        try:
+            price_str = re.sub(r"[^\d.]", "", text)
+            max_price = float(price_str)
+            
+            if max_price < 0:
+                await message.answer("❌ Цена не может быть отрицательной. Попробуйте снова:")
+                return
+            
+            if max_price <= min_price:
+                await message.answer(
+                    f"❌ Максимальная цена должна быть больше минимальной ({min_price}).\n"
+                    f"Попробуйте снова:"
+                )
+                return
+            
+            price_range = f"{min_price} - {max_price}"
+            
+        except ValueError:
+            await message.answer("❌ Пожалуйста, введите число или 'без ограничений':")
+            return
+    
+    await state.update_data(price_max=max_price)
+    
+    # Строим запрос и выполняем поиск
+    query = {
+        "mode": data.get("mode", ""),
+        "city": data.get("city", "").strip(),
+        "district": data.get("district", "").strip(),
+        "rooms": data.get("rooms", "").strip(),
+        "price_min": min_price,
+        "price_max": max_price
+    }
+    
+    logger.info(f"🔍 User {message.from_user.id} custom price search: {query}")
+
+    all_rows = await rows_async()
+    rows = _filter_rows(all_rows, query)
+    
+    USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
+    USER_CURRENT_INDEX[message.from_user.id] = 0
+    
+    if not rows:
+        msg = f"❌ Ничего не найдено в диапазоне {price_range}\n\n"
+        msg += f"Режим: {query['mode']}\n"
+        if query['city']:
+            msg += f"Город: {query['city']}\n"
+        if query['district']:
+            msg += f"Район: {query['district']}\n"
+        if query['rooms']:
+            msg += f"Комнат: {query['rooms']}\n"
+        msg += f"Цена: {price_range}\n"
+        msg += "\nПопробуйте изменить параметры поиска."
+        
+        await message.answer(msg, reply_markup=main_menu(lang))
+        await state.clear()
+        return
+
+    await message.answer(f"✅ Найдено объявлений: {len(rows)} в диапазоне {price_range}")
+    await show_single_ad(message.chat.id, message.from_user.id)
+    await state.clear()
+
+# Стандартный выбор цены (старый метод)
 @dp.message(Wizard.price)
 async def show_results_handler(message: types.Message, state: FSMContext):
     lang = current_lang(message.from_user.id)
