@@ -923,9 +923,21 @@ async def cb_stats(cb: types.CallbackQuery):
     msg += f"  • Кэш: {len(_cached_rows)} объявлений\n"
     msg += f"  • БД: {Config.DB_PATH}\n"
     
-    await cb.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить", callback_data=f"stats:{days}")]]
-    ))
+    # Добавляем timestamp для уникальности
+    msg += f"\n⏰ Обновлено: {datetime.utcnow().strftime('%H:%M:%S')}"
+    
+    try:
+        await cb.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить", callback_data=f"stats:{days}")]]
+        ))
+        await cb.answer("✅ Статистика обновлена")
+    except Exception as e:
+        # Если сообщение не изменилось
+        if "message is not modified" in str(e):
+            await cb.answer("Статистика актуальна", show_alert=False)
+        else:
+            logger.error(f"Error updating stats: {e}")
+            await cb.answer("❌ Ошибка обновления")
 
 @dp.callback_query(F.data.startswith("export:"))
 async def cb_export(cb: types.CallbackQuery):
