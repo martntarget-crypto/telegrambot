@@ -72,93 +72,147 @@ dp = Dispatcher(storage=MemoryStorage())
 class DatabaseManager:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._ensure_valid_db()
         self.init_db()
+    
+    def _ensure_valid_db(self):
+        """Проверяет и создаёт корректную БД если нужно"""
+        if os.path.exists(self.db_path):
+            try:
+                # Пробуем открыть и проверить
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
+                conn.close()
+                logger.info(f"✅ Database file exists and is valid: {self.db_path}")
+                return
+            except Exception as e:
+                logger.warning(f"⚠️ Invalid database file detected: {e}")
+                logger.info(f"🗑 Attempting to remove corrupted database: {self.db_path}")
+                try:
+                    os.remove(self.db_path)
+                    logger.info("✅ Corrupted database removed, will create new one")
+                except Exception as remove_error:
+                    logger.error(f"❌ Failed to remove corrupted database: {remove_error}")
+                    # Создаём с новым именем
+                    backup_name = f"{self.db_path}.backup_{int(time.time())}"
+                    try:
+                        os.rename(self.db_path, backup_name)
+                        logger.info(f"📝 Renamed corrupted DB to: {backup_name}")
+                    except Exception:
+                        # В крайнем случае используем другой путь
+                        self.db_path = f"/tmp/liveplace_stats_{int(time.time())}.db"
+                        logger.warning(f"⚠️ Using temporary database: {self.db_path}")
+        else:
+            logger.info(f"📝 Database file does not exist, will create new: {self.db_path}")
     
     @contextmanager
     def get_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = None
         try:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
             yield conn
             conn.commit()
         except Exception as e:
-            conn.rollback()
-            logger.error(f"Database error: {e}")
+            if conn:
+                conn.rollback()
+            logger.error(f"Database connection error: {e}")
             raise
         finally:
-            conn.close()
+            if conn:
+                conn.close()
     
     def init_db(self):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Таблица действий пользователей
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_actions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        uid INTEGER NOT NULL,
+                        action TEXT NOT NULL,
+                        data TEXT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Таблица поисков
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS searches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        uid INTEGER NOT NULL,
+                        mode TEXT,
+                        city TEXT,
+                        district TEXT,
+                        rooms TEXT,
+                        price TEXT,
+                        price_min REAL,
+                        price_max REAL,
+                        results_count INTEGER,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Таблица лидов
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS leads (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        uid INTEGER NOT NULL,
+                        name TEXT,
+                        phone TEXT,
+                        ad_data TEXT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Таблица избранного
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS favorites (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        uid INTEGER NOT NULL,
+                        action TEXT NOT NULL,
+                        ad_data TEXT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Таблица первых посещений
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS first_seen (
+                        uid INTEGER PRIMARY KEY,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Индексы для ускорения запросов
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_timestamp ON user_actions(timestamp)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_uid ON user_actions(uid)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_searches_timestamp ON searches(timestamp)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_timestamp ON leads(timestamp)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_favorites_timestamp ON favorites(timestamp)")
+                
+                conn.commit()
+                logger.info(f"✅ Database initialized successfully at {self.db_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize database: {e}")
+            logger.error(f"Database path: {self.db_path}")
+            logger.error("Trying to create database in /tmp instead...")
             
-            # Таблица действий пользователей
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_actions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    uid INTEGER NOT NULL,
-                    action TEXT NOT NULL,
-                    data TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # Пробуем создать в /tmp
+            self.db_path = f"/tmp/liveplace_stats_{int(time.time())}.db"
+            logger.info(f"Using fallback path: {self.db_path}")
             
-            # Таблица поисков
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    uid INTEGER NOT NULL,
-                    mode TEXT,
-                    city TEXT,
-                    district TEXT,
-                    rooms TEXT,
-                    price TEXT,
-                    price_min REAL,
-                    price_max REAL,
-                    results_count INTEGER,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Таблица лидов
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS leads (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    uid INTEGER NOT NULL,
-                    name TEXT,
-                    phone TEXT,
-                    ad_data TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Таблица избранного
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS favorites (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    uid INTEGER NOT NULL,
-                    action TEXT NOT NULL,
-                    ad_data TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Таблица первых посещений
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS first_seen (
-                    uid INTEGER PRIMARY KEY,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Индексы для ускорения запросов
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_timestamp ON user_actions(timestamp)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_uid ON user_actions(uid)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_searches_timestamp ON searches(timestamp)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_timestamp ON leads(timestamp)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_favorites_timestamp ON favorites(timestamp)")
-            
-            logger.info("✅ Database initialized successfully")
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("CREATE TABLE IF NOT EXISTS user_actions (id INTEGER PRIMARY KEY)")
+                    logger.info("✅ Fallback database created successfully")
+            except Exception as final_error:
+                logger.critical(f"💥 Cannot create database anywhere: {final_error}")
+                raise
     
     def log_action(self, uid: int, action: str, data: Optional[Dict[str, Any]] = None):
         with self.get_connection() as conn:
