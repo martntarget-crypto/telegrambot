@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LivePlace Telegram Bot — версия с пользовательским ценовым диапазоном
+LivePlace Telegram Bot — версия с постоянным хранением статистики
 """
 
 import os
@@ -10,11 +10,13 @@ import time
 import random
 import asyncio
 import logging
+import sqlite3
 from time import monotonic
-from datetime import datetime
-from typing import List, Dict, Any
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
 from collections import Counter, defaultdict
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from contextlib import contextmanager
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -57,6 +59,7 @@ class Config:
     UTM_CAMPAIGN = os.getenv("UTM_CAMPAIGN", "bot_ads")
     MEDIA_RETRY_COUNT = 3
     MEDIA_RETRY_DELAY = 2
+    DB_PATH = os.getenv("DB_PATH", "liveplace_stats.db")
 
 if not Config.API_TOKEN:
     raise RuntimeError("API_TOKEN is not set")
@@ -64,6 +67,283 @@ if not Config.API_TOKEN:
 # ------ Bot & Dispatcher ------
 bot = Bot(token=Config.API_TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage())
+
+# ------ Database Manager ------
+class DatabaseManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.init_db()
+    
+    @contextmanager
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Database error: {e}")
+            raise
+        finally:
+            conn.close()
+    
+    def init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Таблица действий пользователей
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    data TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Таблица поисков
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS searches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid INTEGER NOT NULL,
+                    mode TEXT,
+                    city TEXT,
+                    district TEXT,
+                    rooms TEXT,
+                    price TEXT,
+                    price_min REAL,
+                    price_max REAL,
+                    results_count INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Таблица лидов
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS leads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid INTEGER NOT NULL,
+                    name TEXT,
+                    phone TEXT,
+                    ad_data TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Таблица избранного
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS favorites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    ad_data TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Таблица первых посещений
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS first_seen (
+                    uid INTEGER PRIMARY KEY,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Индексы для ускорения запросов
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_timestamp ON user_actions(timestamp)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_uid ON user_actions(uid)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_searches_timestamp ON searches(timestamp)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_timestamp ON leads(timestamp)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_favorites_timestamp ON favorites(timestamp)")
+            
+            logger.info("✅ Database initialized successfully")
+    
+    def log_action(self, uid: int, action: str, data: Optional[Dict[str, Any]] = None):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO user_actions (uid, action, data) VALUES (?, ?, ?)",
+                (uid, action, json.dumps(data) if data else None)
+            )
+    
+    def log_search(self, uid: int, query: Dict[str, Any], results_count: int):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO searches (uid, mode, city, district, rooms, price, price_min, price_max, results_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uid,
+                    query.get("mode", ""),
+                    query.get("city", ""),
+                    query.get("district", ""),
+                    query.get("rooms", ""),
+                    query.get("price", ""),
+                    query.get("price_min"),
+                    query.get("price_max"),
+                    results_count
+                )
+            )
+    
+    def log_lead(self, uid: int, name: str, phone: str, ad_data: Dict[str, Any]):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO leads (uid, name, phone, ad_data) VALUES (?, ?, ?, ?)",
+                (uid, name, phone, json.dumps(ad_data))
+            )
+    
+    def log_favorite(self, uid: int, action: str, ad_data: Dict[str, Any]):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO favorites (uid, action, ad_data) VALUES (?, ?, ?)",
+                (uid, action, json.dumps(ad_data))
+            )
+    
+    def register_user(self, uid: int):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO first_seen (uid) VALUES (?)",
+                (uid,)
+            )
+    
+    def get_stats(self, days: int = 1) -> Dict[str, Any]:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Уникальные пользователи
+            cursor.execute(
+                "SELECT COUNT(DISTINCT uid) FROM user_actions WHERE timestamp >= ?",
+                (cutoff_str,)
+            )
+            unique_users = cursor.fetchone()[0]
+            
+            # Новые пользователи
+            cursor.execute(
+                "SELECT COUNT(*) FROM first_seen WHERE timestamp >= ?",
+                (cutoff_str,)
+            )
+            new_users = cursor.fetchone()[0]
+            
+            # Всего действий
+            cursor.execute(
+                "SELECT COUNT(*) FROM user_actions WHERE timestamp >= ?",
+                (cutoff_str,)
+            )
+            total_actions = cursor.fetchone()[0]
+            
+            # Поиски
+            cursor.execute(
+                "SELECT COUNT(*) FROM searches WHERE timestamp >= ?",
+                (cutoff_str,)
+            )
+            searches_count = cursor.fetchone()[0]
+            
+            # Лиды
+            cursor.execute(
+                "SELECT COUNT(*) FROM leads WHERE timestamp >= ?",
+                (cutoff_str,)
+            )
+            leads_count = cursor.fetchone()[0]
+            
+            # Избранное
+            cursor.execute(
+                "SELECT COUNT(*) FROM favorites WHERE action = 'add' AND timestamp >= ?",
+                (cutoff_str,)
+            )
+            favorites_added = cursor.fetchone()[0]
+            
+            cursor.execute(
+                "SELECT COUNT(*) FROM favorites WHERE action = 'remove' AND timestamp >= ?",
+                (cutoff_str,)
+            )
+            favorites_removed = cursor.fetchone()[0]
+            
+            # Статистика по действиям
+            cursor.execute(
+                "SELECT action, COUNT(*) as count FROM user_actions WHERE timestamp >= ? GROUP BY action",
+                (cutoff_str,)
+            )
+            action_counts = {row['action']: row['count'] for row in cursor.fetchall()}
+            
+            # Статистика по режимам
+            cursor.execute(
+                "SELECT mode, COUNT(*) as count FROM searches WHERE timestamp >= ? AND mode != '' GROUP BY mode",
+                (cutoff_str,)
+            )
+            mode_counts = {row['mode']: row['count'] for row in cursor.fetchall()}
+            
+            # Статистика по городам
+            cursor.execute(
+                "SELECT city, COUNT(*) as count FROM searches WHERE timestamp >= ? AND city != '' GROUP BY city ORDER BY count DESC LIMIT 10",
+                (cutoff_str,)
+            )
+            city_counts = {row['city']: row['count'] for row in cursor.fetchall()}
+            
+            # Средние результаты
+            cursor.execute(
+                "SELECT AVG(results_count) FROM searches WHERE timestamp >= ? AND results_count > 0",
+                (cutoff_str,)
+            )
+            avg_results = cursor.fetchone()[0] or 0
+            
+            # Конверсия
+            conversion_rate = (leads_count / searches_count * 100) if searches_count > 0 else 0
+            
+            return {
+                "period_days": days,
+                "unique_users": unique_users,
+                "new_users": new_users,
+                "total_actions": total_actions,
+                "searches": searches_count,
+                "leads": leads_count,
+                "favorites_added": favorites_added,
+                "favorites_removed": favorites_removed,
+                "action_counts": action_counts,
+                "mode_counts": mode_counts,
+                "city_counts": city_counts,
+                "avg_results_per_search": round(avg_results, 1),
+                "conversion_rate": round(conversion_rate, 2)
+            }
+    
+    def export_stats_json(self, days: int = 30) -> str:
+        """Экспорт статистики в JSON"""
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            data = {
+                "export_date": datetime.utcnow().isoformat(),
+                "period_days": days,
+                "searches": [],
+                "leads": [],
+                "favorites": []
+            }
+            
+            # Поиски
+            cursor.execute("SELECT * FROM searches WHERE timestamp >= ?", (cutoff_str,))
+            data["searches"] = [dict(row) for row in cursor.fetchall()]
+            
+            # Лиды
+            cursor.execute("SELECT * FROM leads WHERE timestamp >= ?", (cutoff_str,))
+            data["leads"] = [dict(row) for row in cursor.fetchall()]
+            
+            # Избранное
+            cursor.execute("SELECT * FROM favorites WHERE timestamp >= ?", (cutoff_str,))
+            data["favorites"] = [dict(row) for row in cursor.fetchall()]
+            
+            return json.dumps(data, indent=2, ensure_ascii=False)
+
+db = DatabaseManager(Config.DB_PATH)
 
 # ------ Sheets manager ------
 class SheetsManager:
@@ -313,10 +593,10 @@ class Wizard(StatesGroup):
     city = State()
     district = State()
     rooms = State()
-    price_method = State()  # НОВОЕ: выбор способа указания цены
-    price_min = State()      # НОВОЕ: минимальная цена
-    price_max = State()      # НОВОЕ: максимальная цена
-    price = State()          # старое состояние для стандартного выбора
+    price_method = State()
+    price_min = State()
+    price_max = State()
+    price = State()
 
 # ------ User data ------
 PAGE_SIZE = 8
@@ -362,21 +642,18 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
         if q.get("mode"):
             row_mode = norm_mode(r.get("mode"))
             query_mode = norm_mode(q["mode"])
-            logger.debug(f"Mode check: row={row_mode}, query={query_mode}")
             if row_mode != query_mode:
                 return False
         
         if q.get("city") and q["city"].strip():
             row_city = norm(r.get("city"))
             query_city = norm(q["city"])
-            logger.debug(f"City check: row='{row_city}', query='{query_city}'")
             if row_city != query_city:
                 return False
         
         if q.get("district") and q["district"].strip():
             row_district = norm(r.get("district"))
             query_district = norm(q["district"])
-            logger.debug(f"District check: row='{row_district}', query='{query_district}'")
             if row_district != query_district:
                 return False
         
@@ -392,11 +669,9 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
                 else:
                     if int(need) != int(have) and not (need == 0.5 and have == 0.5):
                         return False
-            except Exception as e:
-                logger.debug(f"Rooms parse error: {e}")
+            except Exception:
                 pass
         
-        # НОВАЯ ЛОГИКА: поддержка пользовательского диапазона
         if q.get("price_min") is not None or q.get("price_max") is not None:
             try:
                 p = float(re.sub(r"[^\d.]", "", str(r.get("price", "")) or "0") or 0)
@@ -410,8 +685,7 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
                     return False
                 if max_val is not None and p > max_val:
                     return False
-            except Exception as e:
-                logger.error(f"Custom price filter error: {e}")
+            except Exception:
                 pass
         
         elif q.get("price") and q["price"].strip() and q["price"].lower() not in {"пропустить", "skip", "გამოტოვება"}:
@@ -441,25 +715,14 @@ def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str
                     p = float(re.sub(r"[^\d.]", "", str(r.get("price", "")) or "0") or 0)
                     if p > cap and cap > 0:
                         return False
-            except Exception as e:
-                logger.error(f"Price filter error: {e}")
+            except Exception:
                 pass
         
         return True
     
     filtered = [r for r in rows if ok(r)]
-    
-    if len(filtered) == 0 and len(rows) > 0:
-        logger.info(f"⚠️ No results for query: {q}")
-        logger.info("Sample rows for debugging:")
-        for i, r in enumerate(rows[:3]):
-            logger.info(f"Row {i}: mode={r.get('mode')}, city={r.get('city')}, district={r.get('district')}")
-    
-    logger.info(f"✅ Filtered {len(filtered)}/{len(rows)} rows with query: {q}")
+    logger.info(f"✅ Filtered {len(filtered)}/{len(rows)} rows")
     return filtered
-
-def _slice(listing: List[Any], page: int, size: int) -> List[Any]:
-    return listing[page*size:(page+1)*size]
 
 # ------ Safe media sending ------
 async def send_media_safe(chat_id: int, photos: List[str], text: str, retry_count: int = Config.MEDIA_RETRY_COUNT) -> bool:
@@ -473,38 +736,21 @@ async def send_media_safe(chat_id: int, photos: List[str], text: str, retry_coun
                 media.append(InputMediaPhoto(media=p))
             
             await bot.send_media_group(chat_id, media)
-            logger.info(f"✅ Media sent successfully: {len(photos)} photos")
             return True
             
         except Exception as e:
             error_msg = str(e)
             logger.error(f"❌ Attempt {attempt + 1}/{retry_count} failed: {error_msg}")
             
-            if "WEBPAGE_CURL_FAILED" in error_msg:
-                logger.error(f"🚫 WEBPAGE_CURL_FAILED for photos: {photos}")
-                if Config.ADMIN_CHAT_ID:
-                    try:
-                        await bot.send_message(
-                            Config.ADMIN_CHAT_ID,
-                            f"⚠️ WEBPAGE_CURL_FAILED\nPhotos:\n{chr(10).join(photos[:3])}"
-                        )
-                    except Exception:
-                        pass
-                return False
-                
-            elif "WEBPAGE_MEDIA_EMPTY" in error_msg:
-                logger.error(f"🚫 WEBPAGE_MEDIA_EMPTY for photos: {photos}")
+            if "WEBPAGE_CURL_FAILED" in error_msg or "WEBPAGE_MEDIA_EMPTY" in error_msg:
                 return False
             
             if attempt < retry_count - 1:
                 await asyncio.sleep(Config.MEDIA_RETRY_DELAY)
-            else:
-                logger.error(f"💥 All {retry_count} attempts failed")
-                return False
     
     return False
 
-# ------ Commands & Handlers ------
+# ------ Commands ------
 @dp.message(Command("start", "menu"))
 async def cmd_start(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -513,6 +759,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
         USER_LANG[uid] = LANG_MAP.get(code, "ru")
     lang = current_lang(uid)
     await state.clear()
+    
+    db.register_user(uid)
+    db.log_action(uid, "start")
+    
     await message.answer(t(lang, "start"), reply_markup=main_menu(lang))
 
 @dp.message(Command("about"))
@@ -529,7 +779,7 @@ async def cmd_health(message: types.Message):
         f"Sheets enabled: {Config.SHEETS_ENABLED}\n"
         f"Cached rows: {len(_cached_rows)}\n"
         f"Cache age: {int(monotonic() - _cache_ts)}s\n"
-        f"Refresh interval: {Config.GSHEET_REFRESH_SEC}s"
+        f"DB: {Config.DB_PATH}"
     )
 
 @dp.message(Command("gs"))
@@ -548,15 +798,112 @@ async def cmd_refresh(message: types.Message):
 async def cmd_stats(message: types.Message):
     if message.from_user.id != Config.ADMIN_CHAT_ID:
         return
-    d = datetime.utcnow().strftime("%Y-%m-%d")
-    await message.answer(
-        f"📊 <b>Статистика за сегодня</b>\n\n"
-        f"Пользователей: {len(USER_RESULTS)}\n"
-        f"Избранных: {sum(len(v) for v in USER_FAVS.values())}\n"
-        f"Кэш: {len(_cached_rows)} объявлений"
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📅 За день", callback_data="stats:1"),
+                InlineKeyboardButton(text="📅 За неделю", callback_data="stats:7")
+            ],
+            [
+                InlineKeyboardButton(text="📅 За месяц", callback_data="stats:30"),
+                InlineKeyboardButton(text="📅 За всё время", callback_data="stats:365")
+            ],
+            [
+                InlineKeyboardButton(text="📥 Экспорт JSON", callback_data="export:30")
+            ]
+        ]
     )
+    await message.answer("📊 <b>Статистика бота</b>\n\nВыберите период:", reply_markup=kb)
 
-# ------ НОВОЕ: Обработчик кнопки "Назад" ------
+@dp.callback_query(F.data.startswith("stats:"))
+async def cb_stats(cb: types.CallbackQuery):
+    if cb.from_user.id != Config.ADMIN_CHAT_ID:
+        await cb.answer("Недостаточно прав")
+        return
+    
+    days = int(cb.data.split(":")[1])
+    
+    if days == 1:
+        period_name = "сегодня"
+    elif days == 7:
+        period_name = "за неделю"
+    elif days == 30:
+        period_name = "за месяц"
+    else:
+        period_name = "за всё время"
+    
+    data = db.get_stats(days)
+    
+    msg = f"📊 <b>Статистика {period_name}</b>\n\n"
+    msg += f"👥 <b>Пользователи:</b>\n"
+    msg += f"  • Уникальных: {data['unique_users']}\n"
+    msg += f"  • Новых: {data['new_users']}\n\n"
+    
+    msg += f"🔍 <b>Активность:</b>\n"
+    msg += f"  • Всего действий: {data['total_actions']}\n"
+    msg += f"  • Поисков: {data['searches']}\n"
+    msg += f"  • Заявок: {data['leads']}\n"
+    msg += f"  • В избранное: {data['favorites_added']}\n"
+    msg += f"  • Из избранного: {data['favorites_removed']}\n\n"
+    
+    if data['searches'] > 0:
+        msg += f"📈 <b>Показатели:</b>\n"
+        msg += f"  • Среднее результатов: {data['avg_results_per_search']}\n"
+        msg += f"  • Конверсия в лиды: {data['conversion_rate']}%\n\n"
+    
+    if data['mode_counts']:
+        msg += f"🏠 <b>Режимы поиска:</b>\n"
+        for mode, count in sorted(data['mode_counts'].items(), key=lambda x: -x[1])[:5]:
+            mode_name = {"rent": "Аренда", "sale": "Продажа", "daily": "Посуточно"}.get(mode, mode)
+            msg += f"  • {mode_name}: {count}\n"
+        msg += "\n"
+    
+    if data['city_counts']:
+        msg += f"🏙 <b>Топ городов:</b>\n"
+        for city, count in sorted(data['city_counts'].items(), key=lambda x: -x[1])[:5]:
+            msg += f"  • {city}: {count}\n"
+        msg += "\n"
+    
+    msg += f"💾 <b>Система:</b>\n"
+    msg += f"  • Кэш: {len(_cached_rows)} объявлений\n"
+    msg += f"  • БД: {Config.DB_PATH}\n"
+    
+    await cb.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить", callback_data=f"stats:{days}")]]
+    ))
+
+@dp.callback_query(F.data.startswith("export:"))
+async def cb_export(cb: types.CallbackQuery):
+    if cb.from_user.id != Config.ADMIN_CHAT_ID:
+        await cb.answer("Недостаточно прав")
+        return
+    
+    days = int(cb.data.split(":")[1])
+    await cb.answer("Создаю экспорт...")
+    
+    try:
+        json_data = db.export_stats_json(days)
+        
+        filename = f"liveplace_stats_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(json_data)
+        
+        with open(filename, 'rb') as f:
+            await bot.send_document(
+                cb.message.chat.id,
+                types.BufferedInputFile(f.read(), filename=filename),
+                caption=f"📥 Экспорт статистики за {days} дней"
+            )
+        
+        os.remove(filename)
+        
+    except Exception as e:
+        logger.error(f"Export error: {e}")
+        await cb.message.answer(f"❌ Ошибка экспорта: {e}")
+
+# ------ Back button handler ------
 @dp.message(F.text.in_([T["btn_back"]["ru"], T["btn_back"]["en"], T["btn_back"]["ka"]]))
 async def handle_back(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
@@ -654,19 +1001,21 @@ async def handle_back(message: types.Message, state: FSMContext):
     
     elif current_state == Wizard.price_max.state:
         await state.set_state(Wizard.price_min)
-        await message.answer("⬅️ Введите минимальную цену в рублях или долларах (например: 500 или 500$):")
+        await message.answer("⬅️ Введите минимальную цену:")
     
     else:
         await state.clear()
         await message.answer("⬅️ Главное меню", reply_markup=main_menu(lang))
 
-# ------ Start search flow (Wizard) ------
+# ------ Search flow ------
 @dp.message(F.text.in_([T["btn_search"]["ru"], T["btn_search"]["en"], T["btn_search"]["ka"]]))
 @dp.message(Command("search"))
 async def start_search(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(Wizard.mode)
     lang = current_lang(message.from_user.id)
+    
+    db.log_action(message.from_user.id, "search_start")
     
     kb = ReplyKeyboardMarkup(
         keyboard=[
@@ -688,11 +1037,9 @@ async def pick_city_mode(message: types.Message, state: FSMContext):
         return await message.answer("Укажите rent/sale/daily")
     
     await state.update_data(mode=mode)
-    logger.info(f"User {message.from_user.id} selected mode: {mode}")
 
     rows = await rows_async()
     filtered_rows = [r for r in rows if norm_mode(r.get("mode")) == mode]
-    logger.info(f"Filtered {len(filtered_rows)}/{len(rows)} rows for mode={mode}")
     
     city_counter = Counter([str(r.get("city","")).strip() for r in filtered_rows if r.get("city")])
     
@@ -735,7 +1082,6 @@ async def pick_district(message: types.Message, state: FSMContext):
 
     city = clean_button_text(city_text)
     await state.update_data(city=city)
-    logger.info(f"User selected city: '{city}' (from button: '{city_text}')")
 
     data = await state.get_data()
     mode = data.get("mode", "")
@@ -777,7 +1123,6 @@ async def pick_rooms_or_price(message: types.Message, state: FSMContext):
     else:
         district = clean_button_text(text)
         await state.update_data(district=district)
-        logger.info(f"User selected district: '{district}' (from button: '{text}')")
 
     await state.set_state(Wizard.rooms)
     kb = ReplyKeyboardMarkup(
@@ -795,7 +1140,7 @@ async def pick_price_method(message: types.Message, state: FSMContext):
     lang = current_lang(message.from_user.id)
     text = message.text.strip()
     
-    if text.lower() in {t(lang, "btn_skip").lower(), "пропустить", "skip", "весь город", "весь район"}:
+    if text.lower() in {t(lang, "btn_skip").lower(), "пропустить", "skip"}:
         await state.update_data(rooms="")
     else:
         val = text.strip().lower()
@@ -803,7 +1148,6 @@ async def pick_price_method(message: types.Message, state: FSMContext):
             val = "0.5"
         await state.update_data(rooms=val)
 
-    # НОВОЕ: выбор метода указания цены
     await state.set_state(Wizard.price_method)
     kb = ReplyKeyboardMarkup(
         keyboard=[
@@ -815,14 +1159,12 @@ async def pick_price_method(message: types.Message, state: FSMContext):
     )
     await message.answer("Как вы хотите указать цену?", reply_markup=kb)
 
-# НОВОЕ: обработка выбора метода указания цены
 @dp.message(Wizard.price_method)
 async def handle_price_method(message: types.Message, state: FSMContext):
     lang = current_lang(message.from_user.id)
     text = message.text.strip()
     
     if text == T["btn_standard_ranges"][lang]:
-        # Стандартные диапазоны
         data = await state.get_data()
         mode = data.get("mode","sale")
         ranges = PRICE_RANGES.get(mode, PRICE_RANGES["sale"])
@@ -836,21 +1178,18 @@ async def handle_price_method(message: types.Message, state: FSMContext):
         await message.answer("Выберите ценовой диапазон:", reply_markup=kb)
     
     elif text == T["btn_custom_price"][lang]:
-        # Свой диапазон
         await state.set_state(Wizard.price_min)
         await message.answer(
             "💰 <b>Укажите свой ценовой диапазон</b>\n\n"
-            "Введите <b>минимальную</b> цену в рублях или долларах\n"
+            "Введите <b>минимальную</b> цену\n"
             "(например: 500 или 500$):"
         )
 
-# НОВОЕ: обработка минимальной цены
 @dp.message(Wizard.price_min)
 async def handle_price_min(message: types.Message, state: FSMContext):
     text = message.text.strip()
     
     try:
-        # Извлекаем число из текста
         price_str = re.sub(r"[^\d.]", "", text)
         min_price = float(price_str)
         
@@ -868,9 +1207,8 @@ async def handle_price_min(message: types.Message, state: FSMContext):
         )
     
     except ValueError:
-        await message.answer("❌ Пожалуйста, введите корректное число (например: 1000):")
+        await message.answer("❌ Пожалуйста, введите число (например: 1000):")
 
-# НОВОЕ: обработка максимальной цены
 @dp.message(Wizard.price_max)
 async def handle_price_max(message: types.Message, state: FSMContext):
     lang = current_lang(message.from_user.id)
@@ -906,7 +1244,6 @@ async def handle_price_max(message: types.Message, state: FSMContext):
     
     await state.update_data(price_max=max_price)
     
-    # Строим запрос и выполняем поиск
     query = {
         "mode": data.get("mode", ""),
         "city": data.get("city", "").strip(),
@@ -916,26 +1253,16 @@ async def handle_price_max(message: types.Message, state: FSMContext):
         "price_max": max_price
     }
     
-    logger.info(f"🔍 User {message.from_user.id} custom price search: {query}")
-
     all_rows = await rows_async()
     rows = _filter_rows(all_rows, query)
+    
+    db.log_search(message.from_user.id, query, len(rows))
     
     USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
     USER_CURRENT_INDEX[message.from_user.id] = 0
     
     if not rows:
-        msg = f"❌ Ничего не найдено в диапазоне {price_range}\n\n"
-        msg += f"Режим: {query['mode']}\n"
-        if query['city']:
-            msg += f"Город: {query['city']}\n"
-        if query['district']:
-            msg += f"Район: {query['district']}\n"
-        if query['rooms']:
-            msg += f"Комнат: {query['rooms']}\n"
-        msg += f"Цена: {price_range}\n"
-        msg += "\nПопробуйте изменить параметры поиска."
-        
+        msg = f"❌ Ничего не найдено в диапазоне {price_range}\n\nПопробуйте изменить параметры."
         await message.answer(msg, reply_markup=main_menu(lang))
         await state.clear()
         return
@@ -944,7 +1271,6 @@ async def handle_price_max(message: types.Message, state: FSMContext):
     await show_single_ad(message.chat.id, message.from_user.id)
     await state.clear()
 
-# Стандартный выбор цены (старый метод)
 @dp.message(Wizard.price)
 async def show_results_handler(message: types.Message, state: FSMContext):
     lang = current_lang(message.from_user.id)
@@ -965,31 +1291,17 @@ async def show_results_handler(message: types.Message, state: FSMContext):
         "rooms": data.get("rooms", "").strip(),
         "price": price.strip()
     }
-    
-    logger.info(f"🔍 User {message.from_user.id} search query: {query}")
 
     all_rows = await rows_async()
-    logger.info(f"📦 Total rows loaded: {len(all_rows)}")
-    
     rows = _filter_rows(all_rows, query)
-    logger.info(f"✅ Filtered results: {len(rows)}")
+    
+    db.log_search(message.from_user.id, query, len(rows))
     
     USER_RESULTS[message.from_user.id] = {"query": query, "rows": rows, "page": 0}
     USER_CURRENT_INDEX[message.from_user.id] = 0
     
     if not rows:
-        msg = "❌ Ничего не найдено по вашим параметрам.\n\n"
-        msg += f"Режим: {query['mode']}\n"
-        if query['city']:
-            msg += f"Город: {query['city']}\n"
-        if query['district']:
-            msg += f"Район: {query['district']}\n"
-        if query['rooms']:
-            msg += f"Комнат: {query['rooms']}\n"
-        if query['price']:
-            msg += f"Цена: {query['price']}\n"
-        msg += "\nПопробуйте изменить параметры поиска."
-        
+        msg = "❌ Ничего не найдено по вашим параметрам.\n\nПопробуйте изменить параметры поиска."
         await message.answer(msg, reply_markup=main_menu(lang))
         await state.clear()
         return
@@ -998,7 +1310,7 @@ async def show_results_handler(message: types.Message, state: FSMContext):
     await show_single_ad(message.chat.id, message.from_user.id)
     await state.clear()
 
-# ------ Show single ad with interaction buttons ------
+# ------ Show single ad ------
 async def show_single_ad(chat_id: int, uid: int):
     bundle = USER_RESULTS.get(uid)
     if not bundle:
@@ -1049,7 +1361,7 @@ async def show_single_ad(chat_id: int, uid: int):
     else:
         await bot.send_message(chat_id, text, reply_markup=kb)
 
-# ------ Callback handlers ------
+# ------ Callbacks ------
 @dp.callback_query(F.data.startswith("like:"))
 async def cb_like(cb: types.CallbackQuery):
     uid = cb.from_user.id
@@ -1057,7 +1369,7 @@ async def cb_like(cb: types.CallbackQuery):
     
     bundle = USER_RESULTS.get(uid)
     if not bundle or index >= len(bundle["rows"]):
-        await cb.answer("Ошибка: объявление не найдено")
+        await cb.answer("Ошибка")
         return
     
     row = bundle["rows"][index]
@@ -1068,6 +1380,8 @@ async def cb_like(cb: types.CallbackQuery):
         "timestamp": datetime.utcnow().isoformat()
     }
     USER_LEAD_STATE[uid] = "awaiting_name"
+    
+    db.log_action(uid, "like", {"ad_id": row.get("id", "unknown")})
     
     await cb.answer("Отлично! 👍")
     await cb.message.answer(
@@ -1082,6 +1396,8 @@ async def cb_dislike(cb: types.CallbackQuery):
     index = int(cb.data.split(":")[1])
     
     USER_CURRENT_INDEX[uid] = index + 1
+    
+    db.log_action(uid, "dislike")
     
     await cb.answer("Понятно 👎")
     await show_single_ad(cb.message.chat.id, uid)
@@ -1100,6 +1416,10 @@ async def cb_fav_add(cb: types.CallbackQuery):
     
     if not any(fav.get("index") == index for fav in USER_FAVS[uid]):
         USER_FAVS[uid].append({"index": index, "data": row})
+        
+        db.log_favorite(uid, "add", row)
+        db.log_action(uid, "favorite_add")
+        
         await cb.answer("⭐ Добавлено!")
         
         buttons = [
@@ -1124,7 +1444,18 @@ async def cb_fav_del(cb: types.CallbackQuery):
     uid = cb.from_user.id
     index = int(cb.data.split(":")[1])
     
+    row = None
+    for fav in USER_FAVS[uid]:
+        if fav.get("index") == index:
+            row = fav.get("data")
+            break
+    
     USER_FAVS[uid] = [fav for fav in USER_FAVS[uid] if fav.get("index") != index]
+    
+    if row:
+        db.log_favorite(uid, "remove", row)
+        db.log_action(uid, "favorite_remove")
+    
     await cb.answer("Удалено")
     
     buttons = [
@@ -1142,7 +1473,7 @@ async def cb_fav_del(cb: types.CallbackQuery):
     except Exception:
         pass
 
-# ------ Lead form handlers ------
+# ------ Lead form ------
 async def handle_lead_form(message: types.Message):
     uid = message.from_user.id
     
@@ -1187,6 +1518,9 @@ async def send_lead_to_channel(uid: int):
     lead = USER_LEAD_DATA[uid]
     ad = lead.get("ad_data", {})
     
+    db.log_lead(uid, lead.get('name', ''), lead.get('phone', ''), ad)
+    db.log_action(uid, "lead_submitted")
+    
     text = (
         "🔥 <b>НОВАЯ ЗАЯВКА</b>\n\n"
         f"👤 <b>Имя:</b> {lead.get('name', 'Не указано')}\n"
@@ -1210,17 +1544,8 @@ async def send_lead_to_channel(uid: int):
             logger.error(f"❌ Attempt {attempt + 1}/3 failed to send lead: {e}")
             if attempt < 2:
                 await asyncio.sleep(2)
-            else:
-                if Config.ADMIN_CHAT_ID and Config.ADMIN_CHAT_ID != Config.FEEDBACK_CHAT_ID:
-                    try:
-                        await bot.send_message(
-                            Config.ADMIN_CHAT_ID, 
-                            f"⚠️ Ошибка отправки лида в канал:\n\n{text}"
-                        )
-                    except Exception:
-                        logger.error("💥 Failed to send to admin as fallback")
 
-# ------ Generic handlers for language and menu ------
+# ------ Other handlers ------
 @dp.message(F.text.in_([T["btn_language"]["ru"], T["btn_language"]["en"], T["btn_language"]["ka"]]))
 async def choose_language(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1249,6 +1574,8 @@ async def quick_pick_entry(msg: types.Message, state: FSMContext):
         await msg.answer("Нет доступных объявлений.")
         return
     
+    db.log_action(msg.from_user.id, "quick_pick")
+    
     sorted_rows = sorted(rows, key=lambda x: str(x.get("published", "")), reverse=True)[:20]
     USER_RESULTS[msg.from_user.id] = {"query": {}, "rows": sorted_rows, "page": 0}
     USER_CURRENT_INDEX[msg.from_user.id] = 0
@@ -1261,6 +1588,9 @@ async def show_favorites(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     favs = USER_FAVS.get(uid, [])
+    
+    db.log_action(uid, "view_favorites")
+    
     if not favs:
         await message.answer("У вас пока нет избранных объявлений.")
     else:
@@ -1276,6 +1606,8 @@ async def show_latest(message: types.Message, state: FSMContext):
     if not rows:
         await message.answer("Нет доступных объявлений.")
         return
+    
+    db.log_action(message.from_user.id, "view_latest")
     
     sorted_rows = sorted(rows, key=lambda x: str(x.get("published", "")), reverse=True)[:20]
     USER_RESULTS[message.from_user.id] = {"query": {}, "rows": sorted_rows, "page": 0}
@@ -1294,7 +1626,7 @@ async def show_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(T["menu_title"][lang], reply_markup=main_menu(lang))
 
-# ------ catch-all (ДОЛЖЕН БЫТЬ ПОСЛЕДНИМ!) ------
+# ------ Fallback ------
 @dp.message()
 async def fallback_all(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -1307,8 +1639,6 @@ async def fallback_all(message: types.Message, state: FSMContext):
     if not text:
         await message.answer("Я получил сообщение, но оно пустое.")
         return
-    
-    logger.warning(f"Unhandled message from user {uid}: '{text}'")
     
     await message.answer(
         "Если хотите начать поиск — нажмите '🔎 Поиск' или '🟢 Быстрый подбор' в меню.", 
@@ -1323,16 +1653,6 @@ async def auto_refresh_cache():
             logger.info("🔄 Auto-refresh: loading data from Google Sheets...")
             rows = await rows_async(force=True)
             logger.info(f"✅ Auto-refresh complete: {len(rows)} rows in cache")
-            
-            if Config.ADMIN_CHAT_ID and monotonic() % 3600 < Config.GSHEET_REFRESH_SEC:
-                try:
-                    await bot.send_message(
-                        Config.ADMIN_CHAT_ID,
-                        f"🔄 Автообновление: загружено {len(rows)} объявлений"
-                    )
-                except Exception:
-                    pass
-                    
         except Exception as e:
             logger.exception(f"❌ Auto-refresh error: {e}")
             await asyncio.sleep(60)
@@ -1358,7 +1678,8 @@ async def startup():
                 f"✅ <b>LivePlace bot started</b>\n\n"
                 f"📊 Loaded: {len(_cached_rows)} ads\n"
                 f"🔄 Auto-refresh: every {Config.GSHEET_REFRESH_SEC}s\n"
-                f"📢 Feedback channel: {Config.FEEDBACK_CHAT_ID}"
+                f"📢 Feedback channel: {Config.FEEDBACK_CHAT_ID}\n"
+                f"💾 Database: {Config.DB_PATH}"
             )
         except Exception as e:
             logger.error(f"Failed to notify admin on startup: {e}")
