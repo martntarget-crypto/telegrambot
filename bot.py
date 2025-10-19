@@ -215,187 +215,224 @@ class DatabaseManager:
                 raise
     
     def log_action(self, uid: int, action: str, data: Optional[Dict[str, Any]] = None):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO user_actions (uid, action, data) VALUES (?, ?, ?)",
-                (uid, action, json.dumps(data) if data else None)
-            )
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO user_actions (uid, action, data) VALUES (?, ?, ?)",
+                    (uid, action, json.dumps(data) if data else None)
+                )
+        except Exception as e:
+            logger.error(f"Failed to log action: {e}")
     
     def log_search(self, uid: int, query: Dict[str, Any], results_count: int):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT INTO searches (uid, mode, city, district, rooms, price, price_min, price_max, results_count)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    uid,
-                    query.get("mode", ""),
-                    query.get("city", ""),
-                    query.get("district", ""),
-                    query.get("rooms", ""),
-                    query.get("price", ""),
-                    query.get("price_min"),
-                    query.get("price_max"),
-                    results_count
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """INSERT INTO searches (uid, mode, city, district, rooms, price, price_min, price_max, results_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        uid,
+                        query.get("mode", ""),
+                        query.get("city", ""),
+                        query.get("district", ""),
+                        query.get("rooms", ""),
+                        query.get("price", ""),
+                        query.get("price_min"),
+                        query.get("price_max"),
+                        results_count
+                    )
                 )
-            )
+        except Exception as e:
+            logger.error(f"Failed to log search: {e}")
     
     def log_lead(self, uid: int, name: str, phone: str, ad_data: Dict[str, Any]):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO leads (uid, name, phone, ad_data) VALUES (?, ?, ?, ?)",
-                (uid, name, phone, json.dumps(ad_data))
-            )
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO leads (uid, name, phone, ad_data) VALUES (?, ?, ?, ?)",
+                    (uid, name, phone, json.dumps(ad_data))
+                )
+        except Exception as e:
+            logger.error(f"Failed to log lead: {e}")
     
     def log_favorite(self, uid: int, action: str, ad_data: Dict[str, Any]):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO favorites (uid, action, ad_data) VALUES (?, ?, ?)",
-                (uid, action, json.dumps(ad_data))
-            )
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO favorites (uid, action, ad_data) VALUES (?, ?, ?)",
+                    (uid, action, json.dumps(ad_data))
+                )
+        except Exception as e:
+            logger.error(f"Failed to log favorite: {e}")
     
     def register_user(self, uid: int):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT OR IGNORE INTO first_seen (uid) VALUES (?)",
-                (uid,)
-            )
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR IGNORE INTO first_seen (uid) VALUES (?)",
+                    (uid,)
+                )
+        except Exception as e:
+            logger.error(f"Failed to register user: {e}")
     
     def get_stats(self, days: int = 1) -> Dict[str, Any]:
-        cutoff = datetime.utcnow() - timedelta(days=days)
-        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-        
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
             
-            # Уникальные пользователи
-            cursor.execute(
-                "SELECT COUNT(DISTINCT uid) FROM user_actions WHERE timestamp >= ?",
-                (cutoff_str,)
-            )
-            unique_users = cursor.fetchone()[0]
-            
-            # Новые пользователи
-            cursor.execute(
-                "SELECT COUNT(*) FROM first_seen WHERE timestamp >= ?",
-                (cutoff_str,)
-            )
-            new_users = cursor.fetchone()[0]
-            
-            # Всего действий
-            cursor.execute(
-                "SELECT COUNT(*) FROM user_actions WHERE timestamp >= ?",
-                (cutoff_str,)
-            )
-            total_actions = cursor.fetchone()[0]
-            
-            # Поиски
-            cursor.execute(
-                "SELECT COUNT(*) FROM searches WHERE timestamp >= ?",
-                (cutoff_str,)
-            )
-            searches_count = cursor.fetchone()[0]
-            
-            # Лиды
-            cursor.execute(
-                "SELECT COUNT(*) FROM leads WHERE timestamp >= ?",
-                (cutoff_str,)
-            )
-            leads_count = cursor.fetchone()[0]
-            
-            # Избранное
-            cursor.execute(
-                "SELECT COUNT(*) FROM favorites WHERE action = 'add' AND timestamp >= ?",
-                (cutoff_str,)
-            )
-            favorites_added = cursor.fetchone()[0]
-            
-            cursor.execute(
-                "SELECT COUNT(*) FROM favorites WHERE action = 'remove' AND timestamp >= ?",
-                (cutoff_str,)
-            )
-            favorites_removed = cursor.fetchone()[0]
-            
-            # Статистика по действиям
-            cursor.execute(
-                "SELECT action, COUNT(*) as count FROM user_actions WHERE timestamp >= ? GROUP BY action",
-                (cutoff_str,)
-            )
-            action_counts = {row['action']: row['count'] for row in cursor.fetchall()}
-            
-            # Статистика по режимам
-            cursor.execute(
-                "SELECT mode, COUNT(*) as count FROM searches WHERE timestamp >= ? AND mode != '' GROUP BY mode",
-                (cutoff_str,)
-            )
-            mode_counts = {row['mode']: row['count'] for row in cursor.fetchall()}
-            
-            # Статистика по городам
-            cursor.execute(
-                "SELECT city, COUNT(*) as count FROM searches WHERE timestamp >= ? AND city != '' GROUP BY city ORDER BY count DESC LIMIT 10",
-                (cutoff_str,)
-            )
-            city_counts = {row['city']: row['count'] for row in cursor.fetchall()}
-            
-            # Средние результаты
-            cursor.execute(
-                "SELECT AVG(results_count) FROM searches WHERE timestamp >= ? AND results_count > 0",
-                (cutoff_str,)
-            )
-            avg_results = cursor.fetchone()[0] or 0
-            
-            # Конверсия
-            conversion_rate = (leads_count / searches_count * 100) if searches_count > 0 else 0
-            
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Уникальные пользователи
+                cursor.execute(
+                    "SELECT COUNT(DISTINCT uid) FROM user_actions WHERE timestamp >= ?",
+                    (cutoff_str,)
+                )
+                unique_users = cursor.fetchone()[0]
+                
+                # Новые пользователи
+                cursor.execute(
+                    "SELECT COUNT(*) FROM first_seen WHERE timestamp >= ?",
+                    (cutoff_str,)
+                )
+                new_users = cursor.fetchone()[0]
+                
+                # Всего действий
+                cursor.execute(
+                    "SELECT COUNT(*) FROM user_actions WHERE timestamp >= ?",
+                    (cutoff_str,)
+                )
+                total_actions = cursor.fetchone()[0]
+                
+                # Поиски
+                cursor.execute(
+                    "SELECT COUNT(*) FROM searches WHERE timestamp >= ?",
+                    (cutoff_str,)
+                )
+                searches_count = cursor.fetchone()[0]
+                
+                # Лиды
+                cursor.execute(
+                    "SELECT COUNT(*) FROM leads WHERE timestamp >= ?",
+                    (cutoff_str,)
+                )
+                leads_count = cursor.fetchone()[0]
+                
+                # Избранное
+                cursor.execute(
+                    "SELECT COUNT(*) FROM favorites WHERE action = 'add' AND timestamp >= ?",
+                    (cutoff_str,)
+                )
+                favorites_added = cursor.fetchone()[0]
+                
+                cursor.execute(
+                    "SELECT COUNT(*) FROM favorites WHERE action = 'remove' AND timestamp >= ?",
+                    (cutoff_str,)
+                )
+                favorites_removed = cursor.fetchone()[0]
+                
+                # Статистика по действиям
+                cursor.execute(
+                    "SELECT action, COUNT(*) as count FROM user_actions WHERE timestamp >= ? GROUP BY action",
+                    (cutoff_str,)
+                )
+                action_counts = {row['action']: row['count'] for row in cursor.fetchall()}
+                
+                # Статистика по режимам
+                cursor.execute(
+                    "SELECT mode, COUNT(*) as count FROM searches WHERE timestamp >= ? AND mode != '' GROUP BY mode",
+                    (cutoff_str,)
+                )
+                mode_counts = {row['mode']: row['count'] for row in cursor.fetchall()}
+                
+                # Статистика по городам
+                cursor.execute(
+                    "SELECT city, COUNT(*) as count FROM searches WHERE timestamp >= ? AND city != '' GROUP BY city ORDER BY count DESC LIMIT 10",
+                    (cutoff_str,)
+                )
+                city_counts = {row['city']: row['count'] for row in cursor.fetchall()}
+                
+                # Средние результаты
+                cursor.execute(
+                    "SELECT AVG(results_count) FROM searches WHERE timestamp >= ? AND results_count > 0",
+                    (cutoff_str,)
+                )
+                avg_results = cursor.fetchone()[0] or 0
+                
+                # Конверсия
+                conversion_rate = (leads_count / searches_count * 100) if searches_count > 0 else 0
+                
+                return {
+                    "period_days": days,
+                    "unique_users": unique_users,
+                    "new_users": new_users,
+                    "total_actions": total_actions,
+                    "searches": searches_count,
+                    "leads": leads_count,
+                    "favorites_added": favorites_added,
+                    "favorites_removed": favorites_removed,
+                    "action_counts": action_counts,
+                    "mode_counts": mode_counts,
+                    "city_counts": city_counts,
+                    "avg_results_per_search": round(avg_results, 1),
+                    "conversion_rate": round(conversion_rate, 2)
+                }
+        except Exception as e:
+            logger.error(f"Failed to get stats: {e}")
             return {
                 "period_days": days,
-                "unique_users": unique_users,
-                "new_users": new_users,
-                "total_actions": total_actions,
-                "searches": searches_count,
-                "leads": leads_count,
-                "favorites_added": favorites_added,
-                "favorites_removed": favorites_removed,
-                "action_counts": action_counts,
-                "mode_counts": mode_counts,
-                "city_counts": city_counts,
-                "avg_results_per_search": round(avg_results, 1),
-                "conversion_rate": round(conversion_rate, 2)
+                "unique_users": 0,
+                "new_users": 0,
+                "total_actions": 0,
+                "searches": 0,
+                "leads": 0,
+                "favorites_added": 0,
+                "favorites_removed": 0,
+                "action_counts": {},
+                "mode_counts": {},
+                "city_counts": {},
+                "avg_results_per_search": 0,
+                "conversion_rate": 0
             }
     
     def export_stats_json(self, days: int = 30) -> str:
         """Экспорт статистики в JSON"""
-        cutoff = datetime.utcnow() - timedelta(days=days)
-        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-        
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
             
-            data = {
-                "export_date": datetime.utcnow().isoformat(),
-                "period_days": days,
-                "searches": [],
-                "leads": [],
-                "favorites": []
-            }
-            
-            # Поиски
-            cursor.execute("SELECT * FROM searches WHERE timestamp >= ?", (cutoff_str,))
-            data["searches"] = [dict(row) for row in cursor.fetchall()]
-            
-            # Лиды
-            cursor.execute("SELECT * FROM leads WHERE timestamp >= ?", (cutoff_str,))
-            data["leads"] = [dict(row) for row in cursor.fetchall()]
-            
-            # Избранное
-            cursor.execute("SELECT * FROM favorites WHERE timestamp >= ?", (cutoff_str,))
-            data["favorites"] = [dict(row) for row in cursor.fetchall()]
-            
-            return json.dumps(data, indent=2, ensure_ascii=False)
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                data = {
+                    "export_date": datetime.utcnow().isoformat(),
+                    "period_days": days,
+                    "searches": [],
+                    "leads": [],
+                    "favorites": []
+                }
+                
+                # Поиски
+                cursor.execute("SELECT * FROM searches WHERE timestamp >= ?", (cutoff_str,))
+                data["searches"] = [dict(row) for row in cursor.fetchall()]
+                
+                # Лиды
+                cursor.execute("SELECT * FROM leads WHERE timestamp >= ?", (cutoff_str,))
+                data["leads"] = [dict(row) for row in cursor.fetchall()]
+                
+                # Избранное
+                cursor.execute("SELECT * FROM favorites WHERE timestamp >= ?", (cutoff_str,))
+                data["favorites"] = [dict(row) for row in cursor.fetchall()]
+                
+                return json.dumps(data, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Failed to export stats: {e}")
+            return json.dumps({"error": str(e)}, indent=2)
 
 db = DatabaseManager(Config.DB_PATH)
 
@@ -794,15 +831,41 @@ async def send_media_safe(chat_id: int, photos: List[str], text: str, retry_coun
             
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"❌ Attempt {attempt + 1}/{retry_count} failed: {error_msg}")
+            logger.error(f"❌ Attempt {attempt + 1}/{retry_count} failed: {error_msg[:100]}")
             
-            if "WEBPAGE_CURL_FAILED" in error_msg or "WEBPAGE_MEDIA_EMPTY" in error_msg:
+            # Известные неисправимые ошибки
+            if any(err in error_msg for err in ["WEBPAGE_CURL_FAILED", "WEBPAGE_MEDIA_EMPTY", "FILE_REFERENCE"]):
+                logger.warning(f"🚫 Non-recoverable error, skipping media")
                 return False
             
             if attempt < retry_count - 1:
-                await asyncio.sleep(Config.MEDIA_RETRY_DELAY)
+                await asyncio.sleep(Config.MEDIA_RETRY_DELAY * (attempt + 1))  # Увеличиваем задержку
     
     return False
+
+# ------ Безопасная отправка сообщений ------
+async def safe_send_message(chat_id: int, text: str, **kwargs) -> Optional[types.Message]:
+    """Безопасная отправка сообщения с повторными попытками"""
+    for attempt in range(3):
+        try:
+            return await bot.send_message(chat_id, text, **kwargs)
+        except Exception as e:
+            logger.error(f"Failed to send message (attempt {attempt + 1}): {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+    return None
+
+async def safe_answer(message: types.Message, text: str, **kwargs) -> Optional[types.Message]:
+    """Безопасный ответ на сообщение"""
+    try:
+        return await message.answer(text, **kwargs)
+    except Exception as e:
+        logger.error(f"Failed to answer message: {e}")
+        # Пробуем без форматирования
+        try:
+            return await message.answer(text.replace("<", "").replace(">", ""))
+        except Exception:
+            return None
 
 # ------ Commands ------
 @dp.message(Command("start", "menu"))
@@ -1721,7 +1784,7 @@ async def auto_refresh_cache():
             logger.info(f"✅ Auto-refresh complete: {len(rows)} rows in cache")
         except Exception as e:
             logger.exception(f"❌ Auto-refresh error: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(60)  # Повторная попытка через минуту
 
 async def heartbeat():
     while True:
@@ -1731,11 +1794,31 @@ async def heartbeat():
             logger.exception("❌ Heartbeat error")
         await asyncio.sleep(600)
 
+async def error_handler(update: types.Update, exception: Exception):
+    """Глобальный обработчик ошибок"""
+    logger.error(f"💥 Uncaught error: {exception}", exc_info=True)
+    
+    # Пробуем уведомить админа о критических ошибках
+    if Config.ADMIN_CHAT_ID:
+        try:
+            error_msg = f"⚠️ <b>Ошибка в боте</b>\n\n"
+            error_msg += f"<code>{str(exception)[:500]}</code>\n\n"
+            error_msg += f"Update: {update.update_id if update else 'None'}"
+            await bot.send_message(Config.ADMIN_CHAT_ID, error_msg)
+        except Exception:
+            pass
+    
+    return True  # Подтверждаем, что ошибка обработана
+
 # ------ Startup / Shutdown ------
 async def startup():
     logger.info("🚀 LivePlace bot starting...")
     
-    await rows_async(force=True)
+    try:
+        await rows_async(force=True)
+    except Exception as e:
+        logger.error(f"❌ Failed to load initial data: {e}")
+        logger.warning("⚠️ Bot will continue with empty cache")
     
     if Config.ADMIN_CHAT_ID:
         try:
@@ -1758,6 +1841,17 @@ async def startup():
 async def shutdown():
     try:
         logger.info("🛑 Bot shutting down...")
+        
+        # Уведомляем админа
+        if Config.ADMIN_CHAT_ID:
+            try:
+                await bot.send_message(
+                    Config.ADMIN_CHAT_ID,
+                    "⚠️ <b>LivePlace bot stopped</b>\n\nБот был остановлен"
+                )
+            except Exception:
+                pass
+        
         await bot.session.close()
         logger.info("✅ Bot shutdown complete")
     except Exception as e:
@@ -1765,11 +1859,24 @@ async def shutdown():
 
 # ------ Main ------
 async def main():
+    # Регистрируем глобальный обработчик ошибок
+    dp.errors.register(error_handler)
+    
     try:
         await startup()
+        logger.info("🎯 Starting polling...")
         await dp.start_polling(bot, skip_updates=True)
+    except KeyboardInterrupt:
+        logger.info("⌨️ Received keyboard interrupt")
+    except Exception as e:
+        logger.critical(f"💥 Fatal error in main: {e}", exc_info=True)
     finally:
         await shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Bot stopped by user")
+    except Exception as e:
+        logger.critical(f"💥 Fatal startup error: {e}", exc_info=True)
