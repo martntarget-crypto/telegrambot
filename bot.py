@@ -227,7 +227,7 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(
                 """INSERT INTO searches (uid, mode, city, district, rooms, price, price_min, price_max, results_count)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     uid,
                     query.get("mode", ""),
