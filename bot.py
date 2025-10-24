@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LivePlace Telegram Bot — версия с постоянным хранением статистики
+LivePlace Telegram Bot — версия с постоянным хранением статистики и анимированными лайками
 """
 
 import os
@@ -60,6 +60,11 @@ class Config:
     MEDIA_RETRY_COUNT = 3
     MEDIA_RETRY_DELAY = 2
     DB_PATH = os.getenv("DB_PATH", "liveplace_stats.db")
+    
+    # Стикеры с сердечками для анимации лайков (можно заменить на свои)
+    HEART_STICKERS = [
+        "CAACAgIAAxkBAAEMYBZnNm7vQoE8_Hq9Q-T0AAHxAAGVMXYAAiEPAAKOXQlL0vW8kCWLvrc2BA",
+    ]
 
 if not Config.API_TOKEN:
     raise RuntimeError("API_TOKEN is not set")
@@ -79,7 +84,6 @@ class DatabaseManager:
         """Проверяет и создаёт корректную БД если нужно"""
         if os.path.exists(self.db_path):
             try:
-                # Пробуем открыть и проверить
                 conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
@@ -94,13 +98,11 @@ class DatabaseManager:
                     logger.info("✅ Corrupted database removed, will create new one")
                 except Exception as remove_error:
                     logger.error(f"❌ Failed to remove corrupted database: {remove_error}")
-                    # Создаём с новым именем
                     backup_name = f"{self.db_path}.backup_{int(time.time())}"
                     try:
                         os.rename(self.db_path, backup_name)
                         logger.info(f"📝 Renamed corrupted DB to: {backup_name}")
                     except Exception:
-                        # В крайнем случае используем другой путь
                         self.db_path = f"/tmp/liveplace_stats_{int(time.time())}.db"
                         logger.warning(f"⚠️ Using temporary database: {self.db_path}")
         else:
@@ -128,7 +130,6 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Таблица действий пользователей
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS user_actions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,7 +140,6 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Таблица поисков
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS searches (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,7 +156,6 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Таблица лидов
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS leads (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,7 +167,6 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Таблица избранного
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS favorites (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,7 +177,6 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Таблица первых посещений
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS first_seen (
                         uid INTEGER PRIMARY KEY,
@@ -187,7 +184,6 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Индексы для ускорения запросов
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_timestamp ON user_actions(timestamp)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_uid ON user_actions(uid)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_searches_timestamp ON searches(timestamp)")
@@ -201,7 +197,6 @@ class DatabaseManager:
             logger.error(f"Database path: {self.db_path}")
             logger.error("Trying to create database in /tmp instead...")
             
-            # Пробуем создать в /tmp
             self.db_path = f"/tmp/liveplace_stats_{int(time.time())}.db"
             logger.info(f"Using fallback path: {self.db_path}")
             
@@ -288,42 +283,36 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Уникальные пользователи
                 cursor.execute(
                     "SELECT COUNT(DISTINCT uid) FROM user_actions WHERE timestamp >= ?",
                     (cutoff_str,)
                 )
                 unique_users = cursor.fetchone()[0]
                 
-                # Новые пользователи
                 cursor.execute(
                     "SELECT COUNT(*) FROM first_seen WHERE timestamp >= ?",
                     (cutoff_str,)
                 )
                 new_users = cursor.fetchone()[0]
                 
-                # Всего действий
                 cursor.execute(
                     "SELECT COUNT(*) FROM user_actions WHERE timestamp >= ?",
                     (cutoff_str,)
                 )
                 total_actions = cursor.fetchone()[0]
                 
-                # Поиски
                 cursor.execute(
                     "SELECT COUNT(*) FROM searches WHERE timestamp >= ?",
                     (cutoff_str,)
                 )
                 searches_count = cursor.fetchone()[0]
                 
-                # Лиды
                 cursor.execute(
                     "SELECT COUNT(*) FROM leads WHERE timestamp >= ?",
                     (cutoff_str,)
                 )
                 leads_count = cursor.fetchone()[0]
                 
-                # Избранное
                 cursor.execute(
                     "SELECT COUNT(*) FROM favorites WHERE action = 'add' AND timestamp >= ?",
                     (cutoff_str,)
@@ -336,35 +325,30 @@ class DatabaseManager:
                 )
                 favorites_removed = cursor.fetchone()[0]
                 
-                # Статистика по действиям
                 cursor.execute(
                     "SELECT action, COUNT(*) as count FROM user_actions WHERE timestamp >= ? GROUP BY action",
                     (cutoff_str,)
                 )
                 action_counts = {row['action']: row['count'] for row in cursor.fetchall()}
                 
-                # Статистика по режимам
                 cursor.execute(
                     "SELECT mode, COUNT(*) as count FROM searches WHERE timestamp >= ? AND mode != '' GROUP BY mode",
                     (cutoff_str,)
                 )
                 mode_counts = {row['mode']: row['count'] for row in cursor.fetchall()}
                 
-                # Статистика по городам
                 cursor.execute(
                     "SELECT city, COUNT(*) as count FROM searches WHERE timestamp >= ? AND city != '' GROUP BY city ORDER BY count DESC LIMIT 10",
                     (cutoff_str,)
                 )
                 city_counts = {row['city']: row['count'] for row in cursor.fetchall()}
                 
-                # Средние результаты
                 cursor.execute(
                     "SELECT AVG(results_count) FROM searches WHERE timestamp >= ? AND results_count > 0",
                     (cutoff_str,)
                 )
                 avg_results = cursor.fetchone()[0] or 0
                 
-                # Конверсия
                 conversion_rate = (leads_count / searches_count * 100) if searches_count > 0 else 0
                 
                 return {
@@ -417,15 +401,12 @@ class DatabaseManager:
                     "favorites": []
                 }
                 
-                # Поиски
                 cursor.execute("SELECT * FROM searches WHERE timestamp >= ?", (cutoff_str,))
                 data["searches"] = [dict(row) for row in cursor.fetchall()]
                 
-                # Лиды
                 cursor.execute("SELECT * FROM leads WHERE timestamp >= ?", (cutoff_str,))
                 data["leads"] = [dict(row) for row in cursor.fetchall()]
                 
-                # Избранное
                 cursor.execute("SELECT * FROM favorites WHERE timestamp >= ?", (cutoff_str,))
                 data["favorites"] = [dict(row) for row in cursor.fetchall()]
                 
@@ -727,6 +708,26 @@ async def maybe_show_ad_by_chat(chat_id: int, uid: int):
     LAST_AD_TIME[uid] = time.time()
     LAST_AD_ID[uid] = ad.get("id")
 
+# ------ 🎉 Анимация лайков с сердечками ------
+async def send_like_animation(chat_id: int, message_id: int, uid: int):
+    """Отправляет анимированные эффекты с сердечками при лайке"""
+    
+    # Отправляем анимированный стикер
+    if Config.HEART_STICKERS:
+        try:
+            sticker_id = random.choice(Config.HEART_STICKERS)
+            msg = await bot.send_sticker(chat_id, sticker_id)
+            logger.info(f"✅ Sent heart sticker for user {uid}")
+            
+            # Автоматически удаляем стикер через 3 секунды
+            await asyncio.sleep(3)
+            try:
+                await bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"❌ Failed to send sticker: {e}")
+
 # ------ Filtering ------
 def _filter_rows(rows: List[Dict[str, Any]], q: Dict[str, Any]) -> List[Dict[str, Any]]:
     def ok(r):
@@ -833,39 +834,65 @@ async def send_media_safe(chat_id: int, photos: List[str], text: str, retry_coun
             error_msg = str(e)
             logger.error(f"❌ Attempt {attempt + 1}/{retry_count} failed: {error_msg[:100]}")
             
-            # Известные неисправимые ошибки
             if any(err in error_msg for err in ["WEBPAGE_CURL_FAILED", "WEBPAGE_MEDIA_EMPTY", "FILE_REFERENCE"]):
                 logger.warning(f"🚫 Non-recoverable error, skipping media")
                 return False
             
             if attempt < retry_count - 1:
-                await asyncio.sleep(Config.MEDIA_RETRY_DELAY * (attempt + 1))  # Увеличиваем задержку
+                await asyncio.sleep(Config.MEDIA_RETRY_DELAY * (attempt + 1))
     
     return False
 
-# ------ Безопасная отправка сообщений ------
-async def safe_send_message(chat_id: int, text: str, **kwargs) -> Optional[types.Message]:
-    """Безопасная отправка сообщения с повторными попытками"""
-    for attempt in range(3):
-        try:
-            return await bot.send_message(chat_id, text, **kwargs)
-        except Exception as e:
-            logger.error(f"Failed to send message (attempt {attempt + 1}): {e}")
-            if attempt < 2:
-                await asyncio.sleep(1)
-    return None
-
-async def safe_answer(message: types.Message, text: str, **kwargs) -> Optional[types.Message]:
-    """Безопасный ответ на сообщение"""
-    try:
-        return await message.answer(text, **kwargs)
-    except Exception as e:
-        logger.error(f"Failed to answer message: {e}")
-        # Пробуем без форматирования
-        try:
-            return await message.answer(text.replace("<", "").replace(">", ""))
-        except Exception:
-            return None
+# ------ Show single ad ------
+async def show_single_ad(chat_id: int, uid: int):
+    bundle = USER_RESULTS.get(uid)
+    if not bundle:
+        await bot.send_message(chat_id, "Список пуст.", reply_markup=main_menu(current_lang(uid)))
+        return
+    
+    rows = bundle["rows"]
+    if not rows:
+        await bot.send_message(chat_id, "Нет объявлений.", reply_markup=main_menu(current_lang(uid)))
+        return
+    
+    current_index = USER_CURRENT_INDEX.get(uid, 0)
+    
+    if current_index >= len(rows):
+        await bot.send_message(
+            chat_id, 
+            "🎉 Вы просмотрели все объявления!\n\nВыберите действие:",
+            reply_markup=main_menu(current_lang(uid))
+        )
+        return
+    
+    row = rows[current_index]
+    photos = collect_photos(row)
+    text = format_card(row, current_lang(uid))
+    text += f"\n\n📊 Объявление {current_index + 1} из {len(rows)}"
+    
+    buttons = [
+        [
+            InlineKeyboardButton(text="❤️ Нравится", callback_data=f"like:{current_index}"),
+            InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"dislike:{current_index}")
+        ],
+        [
+            InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_add:{current_index}")
+        ]
+    ]
+    
+    if any(fav.get("index") == current_index for fav in USER_FAVS.get(uid, [])):
+        buttons[1] = [InlineKeyboardButton(text="⭐ Удалить", callback_data=f"fav_del:{current_index}")]
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    if photos:
+        success = await send_media_safe(chat_id, photos, text)
+        if success:
+            await bot.send_message(chat_id, "Выберите действие:", reply_markup=kb)
+        else:
+            await bot.send_message(chat_id, f"{text}\n\n⚠️ Фото недоступны", reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, text, reply_markup=kb)
 
 # ------ Commands ------
 @dp.message(Command("start", "menu"))
@@ -986,7 +1013,6 @@ async def cb_stats(cb: types.CallbackQuery):
     msg += f"  • Кэш: {len(_cached_rows)} объявлений\n"
     msg += f"  • БД: {Config.DB_PATH}\n"
     
-    # Добавляем timestamp для уникальности
     msg += f"\n⏰ Обновлено: {datetime.utcnow().strftime('%H:%M:%S')}"
     
     try:
@@ -995,7 +1021,6 @@ async def cb_stats(cb: types.CallbackQuery):
         ))
         await cb.answer("✅ Статистика обновлена")
     except Exception as e:
-        # Если сообщение не изменилось
         if "message is not modified" in str(e):
             await cb.answer("Статистика актуальна", show_alert=False)
         else:
@@ -1439,57 +1464,6 @@ async def show_results_handler(message: types.Message, state: FSMContext):
     await show_single_ad(message.chat.id, message.from_user.id)
     await state.clear()
 
-# ------ Show single ad ------
-async def show_single_ad(chat_id: int, uid: int):
-    bundle = USER_RESULTS.get(uid)
-    if not bundle:
-        await bot.send_message(chat_id, "Список пуст.", reply_markup=main_menu(current_lang(uid)))
-        return
-    
-    rows = bundle["rows"]
-    if not rows:
-        await bot.send_message(chat_id, "Нет объявлений.", reply_markup=main_menu(current_lang(uid)))
-        return
-    
-    current_index = USER_CURRENT_INDEX.get(uid, 0)
-    
-    if current_index >= len(rows):
-        await bot.send_message(
-            chat_id, 
-            "🎉 Вы просмотрели все объявления!\n\nВыберите действие:",
-            reply_markup=main_menu(current_lang(uid))
-        )
-        return
-    
-    row = rows[current_index]
-    photos = collect_photos(row)
-    text = format_card(row, current_lang(uid))
-    text += f"\n\n📊 Объявление {current_index + 1} из {len(rows)}"
-    
-    buttons = [
-        [
-            InlineKeyboardButton(text="❤️ Нравится", callback_data=f"like:{current_index}"),
-            InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"dislike:{current_index}")
-        ],
-        [
-            InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_add:{current_index}")
-        ]
-    ]
-    
-    if any(fav.get("index") == current_index for fav in USER_FAVS.get(uid, [])):
-        buttons[1] = [InlineKeyboardButton(text="⭐ Удалить", callback_data=f"fav_del:{current_index}")]
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    if photos:
-        success = await send_media_safe(chat_id, photos, text)
-        if success:
-            await bot.send_message(chat_id, "Выберите действие:", reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, f"{text}\n\n⚠️ Фото недоступны", reply_markup=kb)
-    else:
-        await bot.send_message(chat_id, text, reply_markup=kb)
-
 # ------ Callbacks ------
 @dp.callback_query(F.data.startswith("like:"))
 async def cb_like(cb: types.CallbackQuery):
@@ -1512,7 +1486,19 @@ async def cb_like(cb: types.CallbackQuery):
     
     db.log_action(uid, "like", {"ad_id": row.get("id", "unknown")})
     
-    await cb.answer("Отлично! 👍")
+    # 🎉 АНИМИРОВАННЫЕ ЭФФЕКТЫ С СЕРДЕЧКАМИ
+    await cb.answer("💕 Отлично! Это объявление вам понравилось!", show_alert=False)
+    
+    # Запускаем анимацию параллельно
+    asyncio.create_task(send_like_animation(
+        chat_id=cb.message.chat.id,
+        message_id=cb.message.message_id,
+        uid=uid
+    ))
+    
+    # Небольшая задержка для визуального эффекта
+    await asyncio.sleep(0.5)
+    
     await cb.message.answer(
         "📝 <b>Оставьте заявку</b>\n\n"
         "Мы свяжемся с вами в ближайшее время!\n\n"
@@ -1784,7 +1770,7 @@ async def auto_refresh_cache():
             logger.info(f"✅ Auto-refresh complete: {len(rows)} rows in cache")
         except Exception as e:
             logger.exception(f"❌ Auto-refresh error: {e}")
-            await asyncio.sleep(60)  # Повторная попытка через минуту
+            await asyncio.sleep(60)
 
 async def heartbeat():
     while True:
@@ -1793,22 +1779,6 @@ async def heartbeat():
         except Exception:
             logger.exception("❌ Heartbeat error")
         await asyncio.sleep(600)
-
-async def error_handler(update: types.Update, exception: Exception):
-    """Глобальный обработчик ошибок"""
-    logger.error(f"💥 Uncaught error: {exception}", exc_info=True)
-    
-    # Пробуем уведомить админа о критических ошибках
-    if Config.ADMIN_CHAT_ID:
-        try:
-            error_msg = f"⚠️ <b>Ошибка в боте</b>\n\n"
-            error_msg += f"<code>{str(exception)[:500]}</code>\n\n"
-            error_msg += f"Update: {update.update_id if update else 'None'}"
-            await bot.send_message(Config.ADMIN_CHAT_ID, error_msg)
-        except Exception:
-            pass
-    
-    return True  # Подтверждаем, что ошибка обработана
 
 # ------ Startup / Shutdown ------
 async def startup():
@@ -1826,6 +1796,7 @@ async def startup():
                 Config.ADMIN_CHAT_ID, 
                 f"✅ <b>LivePlace bot started</b>\n\n"
                 f"📊 Loaded: {len(_cached_rows)} ads\n"
+                f"💖 Animated likes: ENABLED\n"
                 f"🔄 Auto-refresh: every {Config.GSHEET_REFRESH_SEC}s\n"
                 f"📢 Feedback channel: {Config.FEEDBACK_CHAT_ID}\n"
                 f"💾 Database: {Config.DB_PATH}"
@@ -1842,7 +1813,6 @@ async def shutdown():
     try:
         logger.info("🛑 Bot shutting down...")
         
-        # Уведомляем админа
         if Config.ADMIN_CHAT_ID:
             try:
                 await bot.send_message(
@@ -1859,9 +1829,6 @@ async def shutdown():
 
 # ------ Main ------
 async def main():
-    # Регистрируем глобальный обработчик ошибок
-    dp.errors.register(error_handler)
-    
     try:
         await startup()
         logger.info("🎯 Starting polling...")
