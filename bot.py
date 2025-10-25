@@ -65,15 +65,6 @@ class Config:
     HEART_STICKERS = [
         "CAACAgIAAxkBAAEMYBZnNm7vQoE8_Hq9Q-T0AAHxAAGVMXYAAiEPAAKOXQlL0vW8kCWLvrc2BA",
     ]
-    
-    # ID анимированных эффектов Telegram (6 бесплатных эффектов)
-    # Можно использовать разные эффекты для разных действий
-    EFFECT_HEARTS = "5104841245755180586"      # 💕 Сердечки/поцелуи
-    EFFECT_FIRE = "5104858069142078462"        # 🔥 Огонь
-    EFFECT_PARTY = "5046509860389126442"       # 🎉 Конфетти
-    EFFECT_THUMBS_UP = "5107584321108051014"   # 👍 Большой палец вверх
-    EFFECT_POOP = "5046589136895476101"        # 💩 Какашка (для дизлайков?)
-    EFFECT_THUNDER = "5159385139981059251"     # ⚡ Молния
 
 if not Config.API_TOKEN:
     raise RuntimeError("API_TOKEN is not set")
@@ -721,75 +712,17 @@ async def maybe_show_ad_by_chat(chat_id: int, uid: int):
 async def send_like_animation(chat_id: int, message_id: int, uid: int):
     """Отправляет анимированные эффекты с сердечками при лайке"""
     
-    # Вариант 1: Последовательная анимация с эмодзи (имитация эффекта)
-    try:
-        # Отправляем серию сообщений для создания эффекта анимации
-        frames = [
-            "💕",
-            "💕 ❤️",
-            "💕 ❤️ 💖",
-            "💕 ❤️ 💖 💗",
-            "💕 ❤️ 💖 💗 💓",
-            "💕 ❤️ 💖 💗 💓 💞",
-            "💕 ❤️ 💖 💗 💓 💞 💝",
-            "✨ <b>ОТЛИЧНЫЙ ВЫБОР!</b> ✨",
-        ]
-        
-        msg = await bot.send_message(chat_id, frames[0])
-        
-        for frame in frames[1:]:
-            await asyncio.sleep(0.15)  # Короткая задержка для анимации
-            try:
-                await bot.edit_message_text(
-                    frame,
-                    chat_id=chat_id,
-                    message_id=msg.message_id
-                )
-            except Exception:
-                pass
-        
-        logger.info(f"✅ Sent animated like effect for user {uid}")
-        
-        # Держим финальный кадр 2 секунды
-        await asyncio.sleep(2)
-        try:
-            await bot.delete_message(chat_id, msg.message_id)
-        except Exception:
-            pass
-            
-    except Exception as e:
-        logger.error(f"❌ Failed to send animation: {e}")
-    
-    # Вариант 2: Дополнительно отправляем GIF с сердечками
-    try:
-        # URL популярного GIF с сердечками (можно заменить на свой)
-        gif_url = "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExcXB3aHN4cjN2ZWp5OGthbm5jY3p6dXpmYnFveGRjd3Z5cWFkMnE3aCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/3o6Zt6ML6BklcajjsA/giphy.gif"
-        
-        gif_msg = await bot.send_animation(
-            chat_id,
-            animation=gif_url,
-            caption="💕"
-        )
-        
-        await asyncio.sleep(2)
-        try:
-            await bot.delete_message(chat_id, gif_msg.message_id)
-        except Exception:
-            pass
-            
-    except Exception as e:
-        logger.info(f"ℹ️ Could not send GIF: {e}")
-    
-    # Вариант 3: Если есть стикеры, отправляем стикер
+    # Отправляем анимированный стикер
     if Config.HEART_STICKERS:
         try:
             sticker_id = random.choice(Config.HEART_STICKERS)
-            sticker_msg = await bot.send_sticker(chat_id, sticker_id)
+            msg = await bot.send_sticker(chat_id, sticker_id)
             logger.info(f"✅ Sent heart sticker for user {uid}")
             
-            await asyncio.sleep(1.5)
+            # Автоматически удаляем стикер через 3 секунды
+            await asyncio.sleep(3)
             try:
-                await bot.delete_message(chat_id, sticker_msg.message_id)
+                await bot.delete_message(chat_id, msg.message_id)
             except Exception:
                 pass
         except Exception as e:
@@ -1554,20 +1487,21 @@ async def cb_like(cb: types.CallbackQuery):
     db.log_action(uid, "like", {"ad_id": row.get("id", "unknown")})
     
     # 🎉 АНИМИРОВАННЫЕ ЭФФЕКТЫ С СЕРДЕЧКАМИ
-    # 1. Показываем alert с сердечками
-    await cb.answer("💕 ❤️ ОТЛИЧНЫЙ ВЫБОР! ❤️ 💕", show_alert=True)
+    await cb.answer("💕 Отлично! Это объявление вам понравилось!", show_alert=False)
     
-    # 2. Запускаем анимацию в фоне (НЕ await, чтобы не блокировать)
+    # Запускаем анимацию параллельно
     asyncio.create_task(send_like_animation(
         chat_id=cb.message.chat.id,
         message_id=cb.message.message_id,
         uid=uid
     ))
     
-    # 3. Отправляем форму заявки
+    # Небольшая задержка для визуального эффекта
+    await asyncio.sleep(0.5)
+    
     await cb.message.answer(
-        "💖 <b>Замечательно!</b> 💖\n\n"
-        "📝 <b>Оставьте заявку и мы подберём для вас лучшие варианты!</b>\n\n"
+        "📝 <b>Оставьте заявку</b>\n\n"
+        "Мы свяжемся с вами в ближайшее время!\n\n"
         "Пожалуйста, напишите ваше <b>имя</b>:"
     )
 
@@ -1581,22 +1515,6 @@ async def cb_dislike(cb: types.CallbackQuery):
     db.log_action(uid, "dislike")
     
     await cb.answer("Понятно 👎")
-    
-    # Отправляем следующее объявление с легким эффектом
-    try:
-        msg = await bot.send_message(
-            cb.message.chat.id,
-            "➡️ Показываю следующее...",
-            message_effect_id=Config.EFFECT_THUMBS_UP
-        )
-        await asyncio.sleep(1)
-        try:
-            await bot.delete_message(cb.message.chat.id, msg.message_id)
-        except Exception:
-            pass
-    except Exception:
-        pass
-    
     await show_single_ad(cb.message.chat.id, uid)
 
 @dp.callback_query(F.data.startswith("fav_add:"))
@@ -1617,31 +1535,7 @@ async def cb_fav_add(cb: types.CallbackQuery):
         db.log_favorite(uid, "add", row)
         db.log_action(uid, "favorite_add")
         
-        # Анимация добавления в избранное
-        try:
-            frames = ["⭐", "⭐ ✨", "⭐ ✨ 🌟", "✨ <b>ДОБАВЛЕНО!</b> ✨"]
-            msg = await bot.send_message(cb.message.chat.id, frames[0])
-            
-            for frame in frames[1:]:
-                await asyncio.sleep(0.2)
-                try:
-                    await bot.edit_message_text(
-                        frame,
-                        chat_id=cb.message.chat.id,
-                        message_id=msg.message_id
-                    )
-                except Exception:
-                    pass
-            
-            await asyncio.sleep(1.5)
-            try:
-                await bot.delete_message(cb.message.chat.id, msg.message_id)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        
-        await cb.answer("⭐ Добавлено в избранное!")
+        await cb.answer("⭐ Добавлено!")
         
         buttons = [
             [
@@ -1720,38 +1614,8 @@ async def handle_lead_form(message: types.Message):
         del USER_LEAD_STATE[uid]
         lead_data = USER_LEAD_DATA.pop(uid)
         
-        # Анимация успешной отправки заявки
-        try:
-            frames = [
-                "📤",
-                "📤 ✨",
-                "📤 ✨ ✅",
-                "🎉 <b>ЗАЯВКА ОТПРАВЛЕНА!</b> 🎉"
-            ]
-            msg = await message.answer(frames[0])
-            
-            for frame in frames[1:]:
-                await asyncio.sleep(0.2)
-                try:
-                    await bot.edit_message_text(
-                        frame,
-                        chat_id=message.chat.id,
-                        message_id=msg.message_id
-                    )
-                except Exception:
-                    pass
-            
-            await asyncio.sleep(1)
-            try:
-                await bot.delete_message(message.chat.id, msg.message_id)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        
-        # Отправляем финальное подтверждение
         await message.answer(
-            "✅ <b>Спасибо!</b> Ваша заявка принята! 🔥\n\n"
+            "✅ <b>Спасибо!</b> Ваша заявка принята.\n\n"
             "Мы свяжемся с вами в ближайшее время! 📞",
             reply_markup=main_menu(current_lang(uid))
         )
