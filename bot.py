@@ -712,17 +712,34 @@ async def maybe_show_ad_by_chat(chat_id: int, uid: int):
 async def send_like_animation(chat_id: int, message_id: int, uid: int):
     """Отправляет анимированные эффекты с сердечками при лайке"""
     
-    # Отправляем анимированный стикер
+    # Вариант 1: Отправляем текстовое сообщение с эмодзи-анимацией
+    try:
+        animation_msg = await bot.send_message(
+            chat_id, 
+            "💕 ❤️ 💖 💗 💓 💞 💝\n<b>Отличный выбор!</b>\n💝 💞 💓 💗 💖 ❤️ 💕"
+        )
+        logger.info(f"✅ Sent like animation for user {uid}")
+        
+        # Удаляем через 2 секунды
+        await asyncio.sleep(2)
+        try:
+            await bot.delete_message(chat_id, animation_msg.message_id)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"❌ Failed to send animation: {e}")
+    
+    # Вариант 2: Если есть стикеры, пробуем отправить стикер
     if Config.HEART_STICKERS:
         try:
             sticker_id = random.choice(Config.HEART_STICKERS)
-            msg = await bot.send_sticker(chat_id, sticker_id)
+            sticker_msg = await bot.send_sticker(chat_id, sticker_id)
             logger.info(f"✅ Sent heart sticker for user {uid}")
             
-            # Автоматически удаляем стикер через 3 секунды
-            await asyncio.sleep(3)
+            # Удаляем стикер через 2 секунды
+            await asyncio.sleep(2)
             try:
-                await bot.delete_message(chat_id, msg.message_id)
+                await bot.delete_message(chat_id, sticker_msg.message_id)
             except Exception:
                 pass
         except Exception as e:
@@ -1487,21 +1504,20 @@ async def cb_like(cb: types.CallbackQuery):
     db.log_action(uid, "like", {"ad_id": row.get("id", "unknown")})
     
     # 🎉 АНИМИРОВАННЫЕ ЭФФЕКТЫ С СЕРДЕЧКАМИ
-    await cb.answer("💕 Отлично! Это объявление вам понравилось!", show_alert=False)
+    # 1. Показываем alert с сердечками
+    await cb.answer("💕 ❤️ ОТЛИЧНЫЙ ВЫБОР! ❤️ 💕", show_alert=True)
     
-    # Запускаем анимацию параллельно
+    # 2. Запускаем анимацию в фоне (НЕ await, чтобы не блокировать)
     asyncio.create_task(send_like_animation(
         chat_id=cb.message.chat.id,
         message_id=cb.message.message_id,
         uid=uid
     ))
     
-    # Небольшая задержка для визуального эффекта
-    await asyncio.sleep(0.5)
-    
+    # 3. Отправляем форму заявки
     await cb.message.answer(
-        "📝 <b>Оставьте заявку</b>\n\n"
-        "Мы свяжемся с вами в ближайшее время!\n\n"
+        "💖 <b>Замечательно!</b> 💖\n\n"
+        "📝 <b>Оставьте заявку и мы подберём для вас лучшие варианты!</b>\n\n"
         "Пожалуйста, напишите ваше <b>имя</b>:"
     )
 
